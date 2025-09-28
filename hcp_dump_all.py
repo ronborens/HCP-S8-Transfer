@@ -20,6 +20,42 @@ DEFAULT_ENDPOINTS = [
     # Jobs with expansions for attachments and appointments included directly
     {"name": "jobs", "path": "/jobs", "params": {"page_size": 100, "expand": ["attachments", "appointments"]}, "container_key": "jobs"},
 
+    # Appointments from jobs (paginated child)
+    {"name": "appointments_from_jobs", "path": "/jobs/{id}/appointments", "expand_from": "jobs", "id_field": "id",
+     "params": {}, "container_key": "appointments"},
+
+    # Invoices from jobs (paginated child)
+    {"name": "invoices_from_jobs", "path": "/jobs/{id}/invoices", "expand_from": "jobs", "id_field": "id",
+     "params": {}, "container_key": "invoices"},
+
+    {"name": "job_types", "path": "/job_fields/job_types", "params": {}, "container_key": "job_types"},
+
+    {"name": "leads", "path": "/leads", "params": {}, "container_key": "leads"},
+
+    {"name": "lead_sources", "path": "/lead_sources", "params": {}, "container_key": None},  # Assuming no specific container; adjust if needed
+
+    {"name": "application", "path": "/application", "params": {}, "single_object": True, "container_key": None},
+
+    {"name": "material_categories", "path": "/api/price_book/material_categories", "params": {}, "container_key": "data"},
+
+    # Materials from material categories (paginated child)
+    {"name": "materials_from_categories", "path": "/api/price_book/materials", "expand_from": "material_categories", "id_field": "uuid",
+     "params": {"material_category_uuid": "{uuid}"}, "container_key": "data"},
+
+    {"name": "price_forms", "path": "/api/price_book/price_forms", "params": {}, "container_key": "data"},
+
+    {"name": "company", "path": "/company", "params": {}, "single_object": True, "container_key": None},
+
+    {"name": "schedule_availability", "path": "/company/schedule_availability", "params": {}, "single_object": True, "container_key": None},
+
+    {"name": "booking_windows", "path": "/company/schedule_availability/booking_windows", "params": {}, "container_key": "booking_windows"},
+
+    {"name": "events", "path": "/events", "params": {}, "container_key": "events"},
+
+    {"name": "tags", "path": "/tags", "params": {}, "container_key": "tags"},
+
+    {"name": "invoices", "path": "/invoices", "params": {}, "container_key": "invoices"},
+
     {"name": "estimates", "path": "/estimates", "params": {}, "container_key": "estimates"},
 
     # Checklist expansions (paginated)
@@ -27,6 +63,8 @@ DEFAULT_ENDPOINTS = [
      "params": {"job_uuids": ["{id}"]}, "container_key": "checklists"},
     {"name": "checklists_from_estimates", "path": "/checklists", "expand_from": "estimates", "id_field": "id",
      "params": {"estimate_uuids": ["{id}"]}, "container_key": "checklists"},
+
+    {"name": "payments", "path": "/payments", "params": {}, "container_key": "payments"},
 ]
 
 # -------- Helpers --------
@@ -40,11 +78,17 @@ def auth_headers():
 def get_base_url():
     return os.getenv("HCP_BASE_URL", "https://api.housecallpro.com").rstrip("/")
 
-def robust_get(url, params, headers, retries=5):
+def robust_get(url, params, headers, retries=5, timeout=120):
     backoff = 1.0
     last = None
     for _ in range(retries):
-        r = requests.get(url, params=params, headers=headers, timeout=60)
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        except requests.exceptions.Timeout as e:
+            print(f"[WARN] Timeout occurred for {url}, retrying...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+            continue
         if r.status_code in (429, 500, 502, 503, 504):
             last = r
             time.sleep(backoff)
