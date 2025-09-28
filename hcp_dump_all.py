@@ -13,20 +13,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------- Endpoint definitions (verbose defaults) --------
-# We keep jobs lean, then fetch per-job details with expands so attachments are included reliably.
 DEFAULT_ENDPOINTS = [
     {"name": "customers", "path": "/customers", "params": {}, "container_key": "customers"},
     {"name": "employees", "path": "/employees", "params": {}, "container_key": "employees"},
 
-    # Lean jobs list
-    {"name": "jobs", "path": "/jobs", "params": {"page_size": 100}, "container_key": "jobs"},
-
-    # Per-job details (single-object child), includes attachments, appointments, assigned_employees
-    {"name": "job_details", "path": "/jobs/{id}",
-     "expand_from": "jobs", "id_field": "id",
-     "params": {"expand": ["attachments","appointments","assigned_employees"]},
-     "single_object": True,  # <- tells the expander this is not paginated
-     "container_key": None}, # single object; we write the object itself to NDJSON
+    # Jobs with expansions for attachments and appointments included directly
+    {"name": "jobs", "path": "/jobs", "params": {"page_size": 100, "expand": ["attachments", "appointments"]}, "container_key": "jobs"},
 
     {"name": "estimates", "path": "/estimates", "params": {}, "container_key": "estimates"},
 
@@ -35,10 +27,6 @@ DEFAULT_ENDPOINTS = [
      "params": {"job_uuids": ["{id}"]}, "container_key": "checklists"},
     {"name": "checklists_from_estimates", "path": "/checklists", "expand_from": "estimates", "id_field": "id",
      "params": {"estimate_uuids": ["{id}"]}, "container_key": "checklists"},
-
-    # Appointments (child, paginated) — keep if you want separate collection
-    {"name": "appointments_from_jobs", "path": "/jobs/{id}/appointments", "expand_from": "jobs",
-     "id_field": "id", "params": {}, "container_key": "appointments"},
 ]
 
 # -------- Helpers --------
