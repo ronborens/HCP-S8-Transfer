@@ -292,8 +292,7 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
                 payload, _ = robust_get(url, encode_params(call_params), session_headers)
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 400 and "archived job" in e.response.text.lower():
-                    print(f"[WARN] Skipping archived job {parent_id}")
-                    continue
+                    break
                 else:
                     raise
             with (raw_dir / f"{parent_id}.json").open("w", encoding="utf-8") as f:
