@@ -20,19 +20,19 @@ DEFAULT_ENDPOINTS = [
     # Jobs with expansions for attachments and appointments included directly
     {"name": "jobs", "path": "/jobs", "params": {"page_size": 100, "expand": ["attachments", "appointments"]}, "container_key": "jobs"},
 
-    # Appointments from jobs (paginated child)
+    # Appointments from jobs (non-paginated child)
     {"name": "appointments_from_jobs", "path": "/jobs/{id}/appointments", "expand_from": "jobs", "id_field": "id",
-     "params": {}, "container_key": "appointments"},
+     "params": {}, "container_key": "appointments", "single_object": True},
 
-    # Invoices from jobs (paginated child)
+    # Invoices from jobs (non-paginated child)
     {"name": "invoices_from_jobs", "path": "/jobs/{id}/invoices", "expand_from": "jobs", "id_field": "id",
-     "params": {}, "container_key": "invoices"},
+     "params": {}, "container_key": "invoices", "single_object": True},
 
     {"name": "job_types", "path": "/job_fields/job_types", "params": {}, "container_key": "job_types"},
 
     {"name": "leads", "path": "/leads", "params": {}, "container_key": "leads"},
 
-    {"name": "lead_sources", "path": "/lead_sources", "params": {}, "container_key": None},  # Assuming no specific container; adjust if needed
+    {"name": "lead_sources", "path": "/lead_sources", "params": {}, "container_key": "lead_sources"},
 
     {"name": "application", "path": "/application", "params": {}, "single_object": True, "container_key": None},
 
@@ -288,10 +288,17 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
 
         if single_object:
             # One GET per parent; write raw as <parent_id>.json and append object to NDJSON
-            payload, _ = robust_get(url, encode_params(call_params), session_headers)
+            try:
+                payload, _ = robust_get(url, encode_params(call_params), session_headers)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 400 and "archived job" in e.response.text.lower():
+                    print(f"[WARN] Skipping archived job {parent_id}")
+                    continue
+                else:
+                    raise
             with (raw_dir / f"{parent_id}.json").open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            write_ndjson_line(nd_path, payload, container_key=None)
+            write_ndjson_line(nd_path, payload, container_key=container_key)  # Use container_key here
         else:
             # Paginated child collection
             paginate_collect(session_headers, base_url, path, call_params, page_size,
