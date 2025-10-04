@@ -2,7 +2,7 @@
 """
 Housecall Pro data dump (GET-only) — API Key auth
 Usage:
-    python hcp_dump_all.py --out ./hcp_export [--resume] [--delay-ms 200]
+    python hcp_dump_all.py --out ./hcp_export [--resume] [--delay-ms 200] [--raw-json]
     python hcp_dump_all.py --only jobs --out ./hcp_export
 
 NOTE:
@@ -178,7 +178,9 @@ def write_ndjson_line(nd_path, payload, container_key):
             # For single-object children or fallback
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-def iter_parent_items(outdir, parent_name, parent_container_key):
+def iter_parent_items(outdir, parent_name, parent_container_key, raw_json=False):
+    if not raw_json:
+        return
     raw_dir = outdir / "raw" / parent_name
     if not raw_dir.exists():
         return
@@ -194,13 +196,15 @@ def iter_parent_items(outdir, parent_name, parent_container_key):
 # -------- Pagination and child expansion --------
 
 def paginate_collect(session_headers, base_url, path, base_params, page_size, container_key=None,
-                     outdir=None, name=None, resume=False, delay_ms=0, max_pages=None):
+                     outdir=None, name=None, resume=False, delay_ms=0, max_pages=None, raw_json=False):
     assert not resume or (outdir is not None and name is not None), "resume needs outdir and name"
-    raw_dir = outdir / "raw" / name if outdir and name else None
-    if raw_dir:
-        raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = None
+    if raw_json:
+        raw_dir = outdir / "raw" / name if outdir and name else None
+        if raw_dir:
+            raw_dir.mkdir(parents=True, exist_ok=True)
 
-    seen = existing_pages_for(outdir, name) if resume else set()
+    seen = existing_pages_for(outdir, name) if resume and raw_json else set()
     nd_path = outdir / f"{name}.ndjson" if outdir and name else None
     page = 1
     while True:
@@ -210,7 +214,7 @@ def paginate_collect(session_headers, base_url, path, base_params, page_size, co
 
         if resume and page in seen:
             # Backfill NDJSON from already-saved raw page so ndjson stays in sync
-            if nd_path and raw_dir:
+            if nd_path and raw_json and raw_dir:
                 raw_file = raw_dir / f"page_{page}.json"
                 if raw_file.exists():
                     with raw_file.open("r", encoding="utf-8") as rf:
@@ -228,7 +232,7 @@ def paginate_collect(session_headers, base_url, path, base_params, page_size, co
             break
 
         # Write raw page immediately
-        if raw_dir:
+        if raw_json and raw_dir:
             with (raw_dir / f"page_{page}.json").open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -245,7 +249,7 @@ def paginate_collect(session_headers, base_url, path, base_params, page_size, co
             time.sleep(delay_ms / 1000.0)
 
 def expand_child_collection(session_headers, base_url, listing_name, listing_pages, child_def,
-                            page_size, outdir, resume, delay_ms, max_pages=None, parent_container_key=None):
+                            page_size, outdir, resume, delay_ms, max_pages=None, parent_container_key=None, raw_json=False):
     """
     Handles both paginated children (e.g., /jobs/{id}/appointments) and single-object children
     (e.g., /jobs/{id} with expand lists).
@@ -265,7 +269,7 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
 
     # Fallback: read parents from disk if memory cache had no items
     if not parent_items and parent_container_key:
-        for it in iter_parent_items(outdir, listing_name, parent_container_key):
+        for it in iter_parent_items(outdir, listing_name, parent_container_key, raw_json=raw_json):
             parent_items.append(it)
 
     if not parent_items:
@@ -274,8 +278,10 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
 
     # Prepare output locations for single-object children
     if single_object:
-        raw_dir = outdir / "raw" / child_name
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_dir = None
+        if raw_json:
+            raw_dir = outdir / "raw" / child_name
+            raw_dir.mkdir(parents=True, exist_ok=True)
         nd_path = outdir / f"{child_name}.ndjson"
 
     for it in parent_items:
@@ -295,14 +301,15 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
                     break
                 else:
                     raise
-            with (raw_dir / f"{parent_id}.json").open("w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+            if raw_json and raw_dir:
+                with (raw_dir / f"{parent_id}.json").open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
             write_ndjson_line(nd_path, payload, container_key=container_key)  # Use container_key here
         else:
             # Paginated child collection
             paginate_collect(session_headers, base_url, path, call_params, page_size,
                              container_key, outdir=outdir, name=child_name,
-                             resume=resume, delay_ms=delay_ms, max_pages=max_pages)
+                             resume=resume, delay_ms=delay_ms, max_pages=max_pages, raw_json=raw_json)
 
 # -------- Main --------
 
@@ -318,6 +325,7 @@ def main():
     ap.add_argument("--delay-ms", type=int, default=0, help="Sleep between requests (ms)")
     ap.add_argument("--only", help="Only run a single endpoint by name (e.g. jobs)")
     ap.add_argument("--max-pages", type=int, help="Limit pages fetched per endpoint (testing)")
+    ap.add_argument("--raw-json", action="store_true", help="Enable writing raw JSON files")
     args = ap.parse_args()
 
     outroot = pathlib.Path(args.out).resolve()
@@ -357,20 +365,20 @@ def main():
                 print(f"[INFO] Auto-fetching parent listing '{parent_name}' from {parent_def['path'] if parent_def else '(unknown)'}")
                 paginate_collect(headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
                                  parent_def.get("container_key"), outdir=outdir, name=parent_name,
-                                 resume=args.resume, delay_ms=args.delay_ms, max_pages=args.max_pages)
+                                 resume=args.resume, delay_ms=args.delay_ms, max_pages=args.max_pages, raw_json=args.raw_json)
                 # Put a sentinel in cache to indicate "available"; items will be read from disk
                 cache[parent_name] = [{"payload": {}}]
 
             print(f"[INFO] Expanding child collection {name} via {parent_name}")
             expand_child_collection(headers, base_url, parent_name, cache.get(parent_name), ep,
                                     args.page_size, outdir, args.resume, args.delay_ms, args.max_pages,
-                                    parent_container_key=parent_ck)
+                                    parent_container_key=parent_ck, raw_json=args.raw_json)
             continue
 
         print(f"[INFO] Fetching {name} from {path}")
         paginate_collect(headers, base_url, path, params, args.page_size, container_key,
                          outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
-                         max_pages=args.max_pages)
+                         max_pages=args.max_pages, raw_json=args.raw_json)
         # We don't cache payloads in-memory (large). Disk is the source of truth for children.
 
     manifest = {
