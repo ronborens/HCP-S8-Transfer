@@ -34,8 +34,6 @@ DEFAULT_ENDPOINTS = [
 
     {"name": "lead_sources", "path": "/lead_sources", "params": {}, "container_key": "lead_sources"},
 
-    {"name": "application", "path": "/application", "params": {}, "single_object": True, "container_key": None},
-
     {"name": "material_categories", "path": "/api/price_book/material_categories", "params": {}, "container_key": "data"},
 
     # Materials from material categories (paginated child)
@@ -178,9 +176,7 @@ def write_ndjson_line(nd_path, payload, container_key):
             # For single-object children or fallback
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-def iter_parent_items(outdir, parent_name, parent_container_key, raw_json=False):
-    if not raw_json:
-        return
+def iter_parent_items(outdir, parent_name, parent_container_key):
     raw_dir = outdir / "raw" / parent_name
     if not raw_dir.exists():
         return
@@ -192,6 +188,15 @@ def iter_parent_items(outdir, parent_name, parent_container_key, raw_json=False)
             for it in items:
                 if isinstance(it, dict):
                     yield it
+
+def iter_parent_items_ndjson(outdir, parent_name):
+    nd_path = outdir / f"{parent_name}.ndjson"
+    if not nd_path.exists():
+        return
+    with nd_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
 
 # -------- Pagination and child expansion --------
 
@@ -267,10 +272,14 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
         if isinstance(items, list):
             parent_items.extend([it for it in items if isinstance(it, dict)])
 
-    # Fallback: read parents from disk if memory cache had no items
-    if not parent_items and parent_container_key:
-        for it in iter_parent_items(outdir, listing_name, parent_container_key, raw_json=raw_json):
-            parent_items.append(it)
+    # Fallback: read parents from disk or ndjson if memory cache had no items
+    if not parent_items:
+        if raw_json and parent_container_key:
+            for it in iter_parent_items(outdir, listing_name, parent_container_key):
+                parent_items.append(it)
+        else:
+            for it in iter_parent_items_ndjson(outdir, listing_name):
+                parent_items.append(it)
 
     if not parent_items:
         print(f"[WARN] No parent items found for '{listing_name}', cannot expand '{child_name}'")
@@ -343,6 +352,8 @@ def main():
     if args.only:
         endpoints = [ep for ep in endpoints if ep["name"] == args.only]
 
+    parents = set(ep['expand_from'] for ep in endpoints if 'expand_from' in ep)
+
     cache = {}
     for ep in endpoints:
         name = ep["name"]
@@ -366,7 +377,7 @@ def main():
                 paginate_collect(headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
                                  parent_def.get("container_key"), outdir=outdir, name=parent_name,
                                  resume=args.resume, delay_ms=args.delay_ms, max_pages=args.max_pages, raw_json=args.raw_json)
-                # Put a sentinel in cache to indicate "available"; items will be read from disk
+                # Put a sentinel in cache to indicate "available"; items will be read from disk or ndjson
                 cache[parent_name] = [{"payload": {}}]
 
             print(f"[INFO] Expanding child collection {name} via {parent_name}")
@@ -380,6 +391,8 @@ def main():
                          outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
                          max_pages=args.max_pages, raw_json=args.raw_json)
         # We don't cache payloads in-memory (large). Disk is the source of truth for children.
+        if name in parents:
+            cache[name] = [{"payload": {}}]  # sentinel for expansions
 
     manifest = {
         "base_url": base_url,
