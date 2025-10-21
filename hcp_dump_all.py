@@ -203,16 +203,31 @@ def substitute_params(template_params: Dict[str, Any], parent_obj: Dict[str, Any
 def ensure_dir(p: pathlib.Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-def write_ndjson_line(nd_path: Optional[pathlib.Path], payload: Any, container_key: Optional[str]) -> None:
+def write_ndjson_line(
+    nd_path: Optional[pathlib.Path],
+    payload: Any,
+    container_key: Optional[str],
+    *,
+    allow_envelope: bool = False,  # True only for single-object endpoints
+) -> None:
     if nd_path is None:
         return
     items, _ = extract_items(payload, container_key)
+
+    if not allow_envelope:
+        if isinstance(items, list) and items:
+            with nd_path.open("a", encoding="utf-8") as f:
+                for row in items:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return
+
     with nd_path.open("a", encoding="utf-8") as f:
         if isinstance(items, list) and items:
             for row in items:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         elif isinstance(payload, dict) and payload:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
 
 def read_parent_items_from_raw(outdir: pathlib.Path, parent_name: str, parent_container_key: Optional[str]) -> Iterable[Dict[str, Any]]:
     raw_dir = outdir / "raw" / parent_name
@@ -373,7 +388,7 @@ def paginate_collect(
             raw_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # Append to NDJSON
-        write_ndjson_line(nd_path, payload, container_key)
+        write_ndjson_line(nd_path, payload, container_key, allow_envelope=False)
 
         # Stop conditions
         items, _ = extract_items(payload, container_key)
@@ -411,16 +426,15 @@ def expand_child_collection(
     container_key = child_def.get("container_key")
     single_object = child_def.get("single_object", False)
 
-    # Read parents from disk. Prefer raw pages when available to avoid needing NDJSON backfill ordering.
+    # Prefer RAW parents if present; fall back to NDJSON
     parents = list(read_parent_items_from_raw(outdir, listing_name, parent_container_key))
     if not parents:
         parents = list(read_parent_items_from_ndjson(outdir, listing_name))
-
     if not parents:
         print(f"[WARN] No parent items found for '{listing_name}', cannot expand '{child_name}'")
         return
 
-    # Prepare single-object outputs
+    # Prep single-object outputs
     nd_path: Optional[pathlib.Path] = None
     raw_dir_single: Optional[pathlib.Path] = None
     if single_object:
@@ -429,40 +443,41 @@ def expand_child_collection(
             raw_dir_single = outdir / "raw" / child_name
             ensure_dir(raw_dir_single)
 
-    # env-configurable skip reasons for single-object calls
     skip_substrings = parse_csv_env("HCP_SKIP_ERROR_SUBSTRINGS")
 
-    for idx, it in enumerate(parents, 1):
+    for it in parents:
         if id_field not in it:
             continue
         parent_id = it[id_field]
         call_params = substitute_params(child_def.get("params", {}), it)
         path = child_def["path"].replace("{id}", str(parent_id))
-        url = f"{base_url}{path}"
 
         if single_object:
+            # True single-object: write the whole payload once (envelope allowed)
             try:
-                payload, _ = robust_get(url, encode_params(call_params), session_headers)
+                payload, _ = robust_get(f"{base_url}{path}", encode_params(call_params), session_headers)
             except requests.exceptions.HTTPError as e:
-                # Generic skip-once rules:
-                # - 404: often means no child object exists
-                # - error text contains any configured substrings
+                # Skip a single parent on 404 or configured substrings; propagate others
                 if is_not_found_error(e) or matches_skip_text(e, skip_substrings):
-                    print(f"[WARN] Skipping {child_name} for parent {parent_id} due to {getattr(e.response, 'status_code', None)} / matched skip text")
+                    print(f"[WARN] Skipping {child_name} for parent {parent_id} due to "
+                          f"{getattr(e.response, 'status_code', None)} / matched skip text")
                     if summary_tracker is not None:
                         summary_tracker.setdefault("child_skips", {}).setdefault(child_name, 0)
                         summary_tracker["child_skips"][child_name] += 1
                     continue
-                # Anything else: bubble up so the caller can decide (may disable group on 401/403)
                 raise
 
             if raw_json and raw_dir_single:
-                (raw_dir_single / f"{parent_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            write_ndjson_line(nd_path, payload, container_key=container_key)
+                (raw_dir_single / f"{parent_id}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            # Allow envelope/object for single-object endpoints
+            write_ndjson_line(nd_path, payload, container_key=container_key, allow_envelope=True)
+
         else:
-            # Paginated child collection. Important: isolate raw pages per parent to avoid collisions.
+            # Paginated child collection per parent
             parent_suffix = f"{listing_name}_{parent_id}"
-            paginate_collect(
+            pages = paginate_collect(
                 session_headers,
                 base_url,
                 path,
@@ -477,6 +492,12 @@ def expand_child_collection(
                 raw_json=raw_json,
                 parent_dir_suffix=parent_suffix,
             )
+            # Optional: record parents with no rows in a sparse index file
+            if pages == 0:
+                empty_idx = outdir / f"{child_name}.empty.ndjson"
+                with empty_idx.open("a", encoding="utf-8") as ef:
+                    ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
+
 
 def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:
     if not isinstance(spec, list):
