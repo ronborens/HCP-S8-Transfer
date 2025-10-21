@@ -595,11 +595,29 @@ def main() -> None:
                 parent_out_exists = (outdir / f"{parent_name}.ndjson").exists() or (outdir / "raw" / parent_name).exists()
                 if not parent_out_exists:
                     print(f"[INFO] Fetching parent listing '{parent_name}' from {parent_def['path']}")
-                    paginate_collect(
-                        headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
-                        parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
-                        max_pages=args.max_pages, raw_json=args.raw_json
-                    )
+                    try:
+                        paginate_collect(
+                            headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
+                            parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
+                            max_pages=args.max_pages, raw_json=args.raw_json
+                        )
+                    except requests.exceptions.HTTPError as e:
+                        # If we can’t even fetch the parent due to auth, disable the parent’s group and skip this child.
+                        pgroup = endpoint_group(parent_def)
+                        if is_authz_error(e):
+                            code = getattr(e.response, "status_code", None)
+                            print(f"[WARN] {parent_name}: auth failure ({code}). Disabling group '{pgroup}' for this run.")
+                            disabled_groups.add(pgroup)
+                            summary["auth_failures"].append((parent_name, pgroup, code))
+                            summary["skipped_due_to_group"].append({"name": name, "group": pgroup})
+                            continue
+                        # Optional policy: treat 404 as skip endpoint for certain groups
+                        treat_404_groups = parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
+                        if is_not_found_error(e) and pgroup in treat_404_groups:
+                            print(f"[WARN] {parent_name}: 404 Not Found; skipping parent endpoint (group policy).")
+                            summary["skipped_due_to_404_policy"].append({"name": parent_name, "group": pgroup})
+                            continue
+                        raise
 
                 print(f"[INFO] Expanding child collection {name} via {parent_name}")
                 expand_child_collection(
@@ -607,6 +625,7 @@ def main() -> None:
                     args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json, summary_tracker=summary
                 )
                 summary["processed_endpoints"].append(name)
+
             else:
                 print(f"[INFO] Fetching {name} from {path}")
                 paginate_collect(
@@ -635,6 +654,7 @@ def main() -> None:
 
             # Anything else: fail loud.
             raise
+
 
     # Write or update manifest
     manifest = {
