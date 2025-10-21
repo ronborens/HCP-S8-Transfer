@@ -1,30 +1,54 @@
 #!/usr/bin/env python3
 """
 Housecall Pro data dump (GET-only) — API Key auth
+
 Usage:
     python hcp_dump_all.py --out ./hcp_export [--resume] [--delay-ms 200]
     python hcp_dump_all.py --only jobs --out ./hcp_export
 
-NOTE:
-    Requires HCP_API_KEY environment variable to be set (use a .env file with python-dotenv).
+Env:
+    HCP_API_KEY           required
+    HCP_BASE_URL          optional, defaults to https://api.housecallpro.com
+    HCP_DISABLE_PRICE_BOOK=1 to skip price book endpoints
+
+Notes:
+    - Set HCP_API_KEY via a .env file if desired (python-dotenv supported).
+    - Raw JSON is optional. NDJSON is always written.
 """
-import os, sys, json, time, argparse, pathlib, datetime, requests, re
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import random
+import re
+import sys
+import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
 from dotenv import load_dotenv
+
 load_dotenv()
-default_page_size = 100
-# -------- Endpoint definitions (verbose defaults) --------
-DEFAULT_ENDPOINTS = [
+
+# ---------------- Defaults ----------------
+
+DEFAULT_PAGE_SIZE = 100
+
+DEFAULT_ENDPOINTS: List[Dict[str, Any]] = [
     {"name": "customers", "path": "/customers", "params": {}, "container_key": "customers"},
     {"name": "employees", "path": "/employees", "params": {}, "container_key": "employees"},
 
-    # Jobs with expansions for attachments and appointments included directly
-    {"name": "jobs", "path": "/jobs", "params": {"page_size": default_page_size, "expand": ["attachments", "appointments"]}, "container_key": "jobs"},
+    # Jobs with expansions included directly
+    {"name": "jobs", "path": "/jobs", "params": {"page_size": DEFAULT_PAGE_SIZE, "expand": ["attachments", "appointments"]}, "container_key": "jobs"},
 
-    # Appointments from jobs (non-paginated child)
+    # Children from jobs
     {"name": "appointments_from_jobs", "path": "/jobs/{id}/appointments", "expand_from": "jobs", "id_field": "id",
      "params": {}, "container_key": "appointments", "single_object": True},
 
-    # Invoices from jobs (non-paginated child)
     {"name": "invoices_from_jobs", "path": "/jobs/{id}/invoices", "expand_from": "jobs", "id_field": "id",
      "params": {}, "container_key": "invoices", "single_object": True},
 
@@ -36,7 +60,7 @@ DEFAULT_ENDPOINTS = [
 
     {"name": "material_categories", "path": "/api/price_book/material_categories", "params": {}, "container_key": "data"},
 
-    # Materials from material categories (paginated child)
+    # Paginated child off categories
     {"name": "materials_from_categories", "path": "/api/price_book/materials", "expand_from": "material_categories", "id_field": "uuid",
      "params": {"material_category_uuid": "{uuid}"}, "container_key": "data"},
 
@@ -56,7 +80,7 @@ DEFAULT_ENDPOINTS = [
 
     {"name": "estimates", "path": "/estimates", "params": {}, "container_key": "estimates"},
 
-    # Checklist expansions (paginated)
+    # Checklist expansions
     {"name": "checklists_from_jobs", "path": "/checklists", "expand_from": "jobs", "id_field": "id",
      "params": {"job_uuids": ["{id}"]}, "container_key": "checklists"},
     {"name": "checklists_from_estimates", "path": "/checklists", "expand_from": "estimates", "id_field": "id",
@@ -65,60 +89,94 @@ DEFAULT_ENDPOINTS = [
     {"name": "payments", "path": "/payments", "params": {}, "container_key": "payments"},
 ]
 
-# -------- Helpers --------
+# ---------------- Utility ----------------
 
-def auth_headers():
+TIMESTAMP_DIR_RE = re.compile(r"^\d{8}T\d{6}Z$")
+
+def list_timestamp_dirs(root: pathlib.Path) -> List[pathlib.Path]:
+    if not root.exists():
+        return []
+    out = []
+    for child in root.iterdir():
+        if child.is_dir() and TIMESTAMP_DIR_RE.match(child.name):
+            out.append(child)
+    # sort descending (newest first)
+    return sorted(out, key=lambda p: p.name, reverse=True)
+
+def resolve_outdir(out_root: pathlib.Path, resume: bool) -> pathlib.Path:
+    """
+    If resume:
+      - If out_root is an existing run dir containing manifest.json, use it.
+      - Else if out_root contains timestamped run subdirs, use the newest.
+      - Else create a new timestamped subdir.
+    If not resume:
+      - Always create a new timestamped subdir under out_root (may be equal to out_root if user points to a timestamp dir).
+    """
+    if resume:
+        if (out_root / "manifest.json").exists():
+            ensure_dir(out_root)
+            return out_root
+        runs = list_timestamp_dirs(out_root)
+        if runs:
+            return runs[0]
+        # fall through to create new
+    # create new timestamp dir
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    outdir = out_root / stamp
+    ensure_dir(outdir)
+    return outdir
+
+def compute_resume_cutoff(outdir: pathlib.Path, ordered_names: List[str]) -> int:
+    """
+    Return the highest index i for which '<name>.ndjson' exists in outdir.
+    If none exist, return -1.
+    """
+    last_done = -1
+    for i, name in enumerate(ordered_names):
+        nd = outdir / f"{name}.ndjson"
+        if nd.exists():
+            last_done = i
+    return last_done
+
+
+def utcnow_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+def auth_headers() -> Dict[str, str]:
     key = os.getenv("HCP_API_KEY")
     if not key:
         sys.exit("Missing HCP_API_KEY. Set it in a .env file or your environment.")
     return {"Authorization": f"Token {key}", "Accept": "application/json"}
 
-def get_base_url():
+def get_base_url() -> str:
     return os.getenv("HCP_BASE_URL", "https://api.housecallpro.com").rstrip("/")
 
-def robust_get(url, params, headers, retries=5):
-    backoff = 1.0
-    last = None
-    for _ in range(retries):
-        r = requests.get(url, params=params, headers=headers, timeout=60)
-        if r.status_code in (429, 500, 502, 503, 504):
-            last = r
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-            continue
-        if r.status_code >= 400:
-            # Print server complaint to help debugging, then raise
-            try:
-                print(f"[ERROR] {r.status_code} {url} :: {r.text[:500]}")
-            except Exception:
-                pass
-            r.raise_for_status()
-        try:
-            return r.json(), r
-        except ValueError:
-            # Some endpoints may return empty body (204 handled earlier), or non-JSON
-            return None, r
-    if last is not None:
-        print(f"[ERROR] {last.status_code} {url} :: {last.text[:500]}")
-        last.raise_for_status()
-    raise RuntimeError("robust_get: exhausted retries")
+def encode_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Encode list params with [] suffix and pass through scalars."""
+    out: Dict[str, Any] = {}
+    for k, v in (params or {}).items():
+        if isinstance(v, list):
+            out[f"{k}[]"] = v
+        else:
+            out[k] = v
+    return out
 
-def extract_items(payload, container_key=None):
+def extract_items(payload: Any, container_key: Optional[str]) -> Tuple[List[Any], Optional[str]]:
     if payload is None:
         return [], None
-    if container_key and isinstance(payload, dict) and container_key in payload and isinstance(payload[container_key], list):
-        return payload[container_key], container_key
+    if isinstance(payload, dict):
+        if container_key and isinstance(payload.get(container_key), list):
+            return payload[container_key], container_key
+        for k in ("items", "results", "data"):
+            if isinstance(payload.get(k), list):
+                return payload[k], k
+        return [], None
     if isinstance(payload, list):
         return payload, None
-    if isinstance(payload, dict):
-        for key in ("items", "results", "data"):
-            if key in payload and isinstance(payload[key], list):
-                return payload[key], key
-        return [], None
     return [], None
 
-def substitute_params(template_params, parent_obj):
-    params = {}
+def substitute_params(template_params: Dict[str, Any], parent_obj: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     for k, v in (template_params or {}).items():
         if isinstance(v, list):
             arr = []
@@ -128,37 +186,18 @@ def substitute_params(template_params, parent_obj):
                     arr.append(str(parent_obj.get(field, "")))
                 else:
                     arr.append(item)
-            params[k] = arr
+            out[k] = arr
         elif isinstance(v, str) and v.startswith("{") and v.endswith("}"):
             field = v[1:-1]
-            params[k] = str(parent_obj.get(field, ""))
-        else:
-            params[k] = v
-    return params
-
-def existing_pages_for(outdir, name):
-    raw_dir = outdir / "raw" / name
-    if not raw_dir.exists():
-        return set()
-    pages = set()
-    for p in raw_dir.glob("page_*.json"):
-        m = re.match(r"page_(\d+)\.json$", p.name)
-        if m:
-            pages.add(int(m.group(1)))
-    return pages
-
-def encode_params(params: dict) -> dict:
-    """Encode list params with [] suffix (e.g., expand[])."""
-    out = {}
-    for k, v in (params or {}).items():
-        if isinstance(v, list):
-            out[f"{k}[]"] = v  # requests => k[]=a&k[]=b
+            out[k] = str(parent_obj.get(field, ""))
         else:
             out[k] = v
     return out
 
-def write_ndjson_line(nd_path, payload, container_key):
-    """Append one page/object worth of rows to <name>.ndjson."""
+def ensure_dir(p: pathlib.Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+def write_ndjson_line(nd_path: Optional[pathlib.Path], payload: Any, container_key: Optional[str]) -> None:
     if nd_path is None:
         return
     items, _ = extract_items(payload, container_key)
@@ -167,127 +206,183 @@ def write_ndjson_line(nd_path, payload, container_key):
             for row in items:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         elif isinstance(payload, dict) and payload:
-            # For single-object children or fallback
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-def iter_parent_items(outdir, parent_name, parent_container_key):
+def read_parent_items_from_raw(outdir: pathlib.Path, parent_name: str, parent_container_key: Optional[str]) -> Iterable[Dict[str, Any]]:
     raw_dir = outdir / "raw" / parent_name
     if not raw_dir.exists():
-        return
+        return []
     for p in sorted(raw_dir.glob("page_*.json")):
-        with p.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
         items, _ = extract_items(payload, parent_container_key)
-        if isinstance(items, list):
-            for it in items:
-                if isinstance(it, dict):
-                    yield it
+        for it in items:
+            if isinstance(it, dict):
+                yield it
 
-def iter_parent_items_ndjson(outdir, parent_name):
-    nd_path = outdir / f"{parent_name}.ndjson"
-    if not nd_path.exists():
-        return
-    with nd_path.open("r", encoding="utf-8") as f:
+def read_parent_items_from_ndjson(outdir: pathlib.Path, parent_name: str) -> Iterable[Dict[str, Any]]:
+    nd = outdir / f"{parent_name}.ndjson"
+    if not nd.exists():
+        return []
+    with nd.open("r", encoding="utf-8") as f:
         for line in f:
-            if line.strip():
-                yield json.loads(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    yield obj
+            except Exception:
+                continue
 
-# -------- Pagination and child expansion --------
+# ---------------- HTTP ----------------
 
-def paginate_collect(session_headers, base_url, path, base_params, page_size, container_key=None,
-                     outdir=None, name=None, resume=False, delay_ms=0, max_pages=None, raw_json=False):
-    assert not resume or (outdir is not None and name is not None), "resume needs outdir and name"
-    raw_dir = None
-    if raw_json:
-        raw_dir = outdir / "raw" / name if outdir and name else None
-        if raw_dir:
-            raw_dir.mkdir(parents=True, exist_ok=True)
+TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
-    seen = existing_pages_for(outdir, name) if resume and raw_json else set()
+def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retries: int = 6) -> Tuple[Optional[Any], requests.Response]:
+    backoff = 1.0
+    last: Optional[requests.Response] = None
+    for attempt in range(1, retries + 1):
+        r = requests.get(url, params=params, headers=headers, timeout=60)
+        if r.status_code in TRANSIENT_STATUSES:
+            last = r
+            retry_after = r.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                time.sleep(int(retry_after))
+            else:
+                # jitter to reduce thundering herd
+                sleep_for = backoff + random.uniform(0, backoff * 0.25)
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2, 30)
+            continue
+        if r.status_code >= 400:
+            # Emit limited server text for diagnosis, then raise
+            try:
+                body = r.text[:500]
+                print(f"[ERROR] {r.status_code} {url} :: {body}")
+            except Exception:
+                pass
+            r.raise_for_status()
+        try:
+            return r.json(), r
+        except ValueError:
+            return None, r
+    if last is not None:
+        print(f"[ERROR] {last.status_code} {url} :: {last.text[:500]}")
+        last.raise_for_status()
+    raise RuntimeError("robust_get: exhausted retries with no response")
+
+# ---------------- Pagination and expansion ----------------
+
+def paginate_collect(
+    session_headers: Dict[str, str],
+    base_url: str,
+    path: str,
+    base_params: Dict[str, Any],
+    page_size: int,
+    container_key: Optional[str],
+    outdir: Optional[pathlib.Path],
+    name: Optional[str],
+    resume: bool,
+    delay_ms: int,
+    max_pages: Optional[int],
+    raw_json: bool,
+    parent_dir_suffix: Optional[str] = None,
+) -> int:
+    """
+    Returns the number of pages fetched.
+    """
+    assert not resume or (outdir is not None and name is not None), "resume requires outdir and name"
+
+    # Prepare raw directory
+    raw_dir: Optional[pathlib.Path] = None
+    if raw_json and outdir and name:
+        raw_dir = outdir / "raw" / (name if parent_dir_suffix is None else f"{name}/{parent_dir_suffix}")
+        ensure_dir(raw_dir)
+
     nd_path = outdir / f"{name}.ndjson" if outdir and name else None
+
+    pages_fetched = 0
     page = 1
     while True:
         if max_pages and page > max_pages:
-            print(f"[TEST] Stopping {name} at page {max_pages} for testing")
+            print(f"[INFO] Stopping {name} at configured max-pages={max_pages}")
             break
-
-        if resume and page in seen:
-            # Backfill NDJSON from already-saved raw page so ndjson stays in sync
-            if nd_path and raw_json and raw_dir:
-                raw_file = raw_dir / f"page_{page}.json"
-                if raw_file.exists():
-                    with raw_file.open("r", encoding="utf-8") as rf:
-                        payload = json.load(rf)
-                    write_ndjson_line(nd_path, payload, container_key)
-            page += 1
-            continue
 
         params = dict(base_params or {})
         params.setdefault("page", page)
         params.setdefault("page_size", page_size)
+
         url = f"{base_url}{path}"
         payload, resp = robust_get(url, encode_params(params), session_headers)
         if resp.status_code == 204:
             break
 
-        # Write raw page immediately
-        if raw_json and raw_dir:
-            with (raw_dir / f"page_{page}.json").open("w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+        # Write raw page
+        if raw_dir:
+            raw_file = raw_dir / f"page_{page}.json"
+            raw_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # Append to NDJSON
         write_ndjson_line(nd_path, payload, container_key)
 
-        # Stop when no items found
+        # Stop conditions
         items, _ = extract_items(payload, container_key)
-        if not items:
+        count = len(items)
+        if count == 0:
+            break
+        pages_fetched += 1
+
+        # Heuristic: many APIs stop returning a full page on the last page
+        if count < params["page_size"]:
             break
 
         page += 1
         if delay_ms:
             time.sleep(delay_ms / 1000.0)
 
-def expand_child_collection(session_headers, base_url, listing_name, listing_pages, child_def,
-                            page_size, outdir, resume, delay_ms, max_pages=None, parent_container_key=None, raw_json=False):
-    """
-    Handles both paginated children (e.g., /jobs/{id}/appointments) and single-object children
-    (e.g., /jobs/{id} with expand lists).
-    """
+    return pages_fetched
+
+def expand_child_collection(
+    session_headers: Dict[str, str],
+    base_url: str,
+    listing_name: str,
+    child_def: Dict[str, Any],
+    page_size: int,
+    outdir: pathlib.Path,
+    resume: bool,
+    delay_ms: int,
+    max_pages: Optional[int],
+    parent_container_key: Optional[str],
+    raw_json: bool,
+) -> None:
     id_field = child_def.get("id_field", "id")
     child_name = child_def["name"]
     container_key = child_def.get("container_key")
     single_object = child_def.get("single_object", False)
 
-    # Collect parent items from in-memory pages first
-    parent_items = []
-    for pg in (listing_pages or []):
-        payload = pg.get("payload")
-        items, _ = extract_items(payload, parent_container_key)
-        if isinstance(items, list):
-            parent_items.extend([it for it in items if isinstance(it, dict)])
+    # Read parents from disk. Prefer raw pages when available to avoid needing NDJSON backfill ordering.
+    parents = list(read_parent_items_from_raw(outdir, listing_name, parent_container_key))
+    if not parents:
+        parents = list(read_parent_items_from_ndjson(outdir, listing_name))
 
-    # Fallback: read parents from disk or ndjson if memory cache had no items
-    if not parent_items:
-        if raw_json and parent_container_key:
-            for it in iter_parent_items(outdir, listing_name, parent_container_key):
-                parent_items.append(it)
-        else:
-            for it in iter_parent_items_ndjson(outdir, listing_name):
-                parent_items.append(it)
-
-    if not parent_items:
+    if not parents:
         print(f"[WARN] No parent items found for '{listing_name}', cannot expand '{child_name}'")
         return
 
-    # Prepare output locations for single-object children
+    # Prepare single-object outputs
+    nd_path: Optional[pathlib.Path] = None
+    raw_dir_single: Optional[pathlib.Path] = None
     if single_object:
-        raw_dir = None
-        if raw_json:
-            raw_dir = outdir / "raw" / child_name
-            raw_dir.mkdir(parents=True, exist_ok=True)
         nd_path = outdir / f"{child_name}.ndjson"
+        if raw_json:
+            raw_dir_single = outdir / "raw" / child_name
+            ensure_dir(raw_dir_single)
 
-    for it in parent_items:
+    for idx, it in enumerate(parents, 1):
         if id_field not in it:
             continue
         parent_id = it[id_field]
@@ -296,113 +391,168 @@ def expand_child_collection(session_headers, base_url, listing_name, listing_pag
         url = f"{base_url}{path}"
 
         if single_object:
-            # One GET per parent; write raw as <parent_id>.json and append object to NDJSON
             try:
                 payload, _ = robust_get(url, encode_params(call_params), session_headers)
             except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 400 and "archived job" in e.response.text.lower():
-                    print(f"[WARN] Skipping archived job {parent_id} for {child_name}, stopping further expansions.")
-                    break
+                text = e.response.text.lower() if e.response is not None else ""
+                if e.response is not None and e.response.status_code in (400, 404) and "archived job" in text:
+                    print(f"[WARN] Skipping archived parent {parent_id} for {child_name}")
+                    continue
                 else:
                     raise
-            if raw_json and raw_dir:
-                with (raw_dir / f"{parent_id}.json").open("w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False, indent=2)
-            write_ndjson_line(nd_path, payload, container_key=container_key)  # Use container_key here
+            if raw_json and raw_dir_single:
+                (raw_dir_single / f"{parent_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_ndjson_line(nd_path, payload, container_key=container_key)
         else:
-            # Paginated child collection
-            paginate_collect(session_headers, base_url, path, call_params, page_size,
-                             container_key, outdir=outdir, name=child_name,
-                             resume=resume, delay_ms=delay_ms, max_pages=max_pages, raw_json=raw_json)
+            # Paginated child collection. Important: isolate raw pages per parent to avoid collisions.
+            parent_suffix = f"{listing_name}_{parent_id}"
+            paginate_collect(
+                session_headers,
+                base_url,
+                path,
+                call_params,
+                page_size,
+                container_key,
+                outdir=outdir,
+                name=child_name,
+                resume=resume,
+                delay_ms=delay_ms,
+                max_pages=max_pages,
+                raw_json=raw_json,
+                parent_dir_suffix=parent_suffix,
+            )
 
-# -------- Main --------
+def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:
+    if not isinstance(spec, list):
+        raise ValueError("endpoints spec must be a list")
+    out: List[Dict[str, Any]] = []
+    for ep in spec:
+        if not isinstance(ep, dict):
+            raise ValueError("each endpoint must be a dict")
+        if "name" not in ep or "path" not in ep:
+            raise ValueError("each endpoint requires 'name' and 'path'")
+        out.append(ep)
+    return out
 
-def main():
+# ---------------- Main ----------------
+
+def main() -> None:
     base_url = get_base_url()
     headers = auth_headers()
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="./hcp_export", help="Output directory")
-    ap.add_argument("--page-size", type=int, default=default_page_size, help="page_size to request")
+    ap.add_argument("--out", default="./hcp_export", help="Output directory or existing run dir when --resume")
+    ap.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE, help="page_size to request")
     ap.add_argument("--endpoints-json", help="Optional JSON file to override endpoints")
-    ap.add_argument("--resume", action="store_true", help="Skip already saved pages (and backfill NDJSON)")
+    ap.add_argument("--resume", action="store_true", help="Resume from prior run if possible")
     ap.add_argument("--delay-ms", type=int, default=0, help="Sleep between requests (ms)")
-    ap.add_argument("--only", help="Only run a single endpoint by name (e.g. jobs)")
+    ap.add_argument("--only", help="Only run a single endpoint by name")
     ap.add_argument("--max-pages", type=int, help="Limit pages fetched per endpoint (testing)")
-    ap.add_argument("--raw-json", action="store_true", help="Enable writing raw JSON files")
+    ap.add_argument("--raw-json", action="store_true", help="Write raw JSON pages to disk")
     args = ap.parse_args()
 
-    outroot = pathlib.Path(args.out).resolve()
-    outdir = outroot / datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
-    outdir.mkdir(parents=True, exist_ok=True)
+    out_root = pathlib.Path(args.out).resolve()
+    # Important: choose the folder we will actually WRITE INTO
+    outdir = resolve_outdir(out_root, args.resume)
+    ensure_dir(outdir)
 
+    # Load/validate endpoints
     endpoints = DEFAULT_ENDPOINTS
     if args.endpoints_json:
         try:
             with open(args.endpoints_json, "r", encoding="utf-8") as f:
-                endpoints = json.load(f)
+                endpoints = validate_endpoints(json.load(f))
         except FileNotFoundError:
-            print(f"[WARN] Endpoints JSON {args.endpoints_json} not found, falling back to DEFAULT_ENDPOINTS")
+            print(f"[WARN] Endpoints JSON {args.endpoints_json} not found, falling back to defaults")
+        except Exception as e:
+            sys.exit(f"Invalid endpoints JSON: {e}")
 
     if args.only:
         endpoints = [ep for ep in endpoints if ep["name"] == args.only]
+        if not endpoints:
+            sys.exit(f"--only '{args.only}' did not match any endpoint")
 
-    # Optional gating for price book endpoints when key lacks permissions
     if os.getenv("HCP_DISABLE_PRICE_BOOK", "0") == "1":
         endpoints = [ep for ep in endpoints if not ep["path"].startswith("/api/price_book/")]
 
-    parents = set(ep['expand_from'] for ep in endpoints if 'expand_from' in ep)
-
-    cache = {}
+    # Normalize page size on every endpoint (if not set explicitly)
+    normalized: List[Dict[str, Any]] = []
     for ep in endpoints:
+        ep = dict(ep)
+        p = dict(ep.get("params") or {})
+        p.setdefault("page_size", args.page_size)
+        ep["params"] = p
+        normalized.append(ep)
+    endpoints = normalized
+
+    # Ordered list of endpoint NAMES for resume cutoff semantics
+    ordered_names = [ep["name"] for ep in endpoints]
+
+    # Compute resume cutoff index based on existing NDJSON in the chosen outdir
+    last_done_idx = compute_resume_cutoff(outdir, ordered_names) if args.resume else -1
+    if args.resume and last_done_idx >= 0:
+        print(f"[INFO] Resume enabled. Detected progress up to '{ordered_names[last_done_idx]}' (index {last_done_idx}).")
+        print("[INFO] All endpoints at or before that index will be skipped.")
+
+    # We’ll need this to locate parents for child expansions
+    parents = {ep["expand_from"] for ep in endpoints if "expand_from" in ep}
+
+    for idx, ep in enumerate(endpoints):
         name = ep["name"]
+        if args.resume and idx <= last_done_idx:
+            print(f"[SKIP] {name} (resume cutoff reached at index {last_done_idx})")
+            continue
+
         path = ep["path"]
         params = ep.get("params", {})
         container_key = ep.get("container_key")
 
         if "expand_from" in ep:
             parent_name = ep["expand_from"]
-            parent_pages = cache.get(parent_name)
-
-            # find the parent container_key for disk fallback
             parent_def = next((e for e in endpoints if e["name"] == parent_name and "expand_from" not in e), None)
             if not parent_def:
                 parent_def = next((e for e in DEFAULT_ENDPOINTS if e["name"] == parent_name and "expand_from" not in e), None)
-            parent_ck = parent_def.get("container_key") if parent_def else None
+            if not parent_def:
+                print(f"[WARN] Missing parent definition for '{parent_name}', skipping child '{name}'")
+                continue
 
-            if parent_pages is None:
-                # Auto-fetch parent listing (writes raw pages; we then read from disk)
-                print(f"[INFO] Auto-fetching parent listing '{parent_name}' from {parent_def['path'] if parent_def else '(unknown)'}")
-                paginate_collect(headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
-                                 parent_def.get("container_key"), outdir=outdir, name=parent_name,
-                                 resume=args.resume, delay_ms=args.delay_ms, max_pages=args.max_pages, raw_json=args.raw_json)
-                # Put a sentinel in cache to indicate "available"; items will be read from disk or ndjson
-                cache[parent_name] = [{"payload": {}}]
+            # Ensure parent listing exists before we expand
+            parent_ck = parent_def.get("container_key")
+            parent_out_exists = (outdir / f"{parent_name}.ndjson").exists() or (outdir / "raw" / parent_name).exists()
+            if not parent_out_exists:
+                print(f"[INFO] Fetching parent listing '{parent_name}' from {parent_def['path']}")
+                paginate_collect(
+                    headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
+                    parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
+                    max_pages=args.max_pages, raw_json=args.raw_json
+                )
 
             print(f"[INFO] Expanding child collection {name} via {parent_name}")
-            expand_child_collection(headers, base_url, parent_name, cache.get(parent_name), ep,
-                                    args.page_size, outdir, args.resume, args.delay_ms, args.max_pages,
-                                    parent_container_key=parent_ck, raw_json=args.raw_json)
+            expand_child_collection(
+                headers, base_url, parent_name, ep, args.page_size, outdir, args.resume, args.delay_ms,
+                args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json
+            )
             continue
 
         print(f"[INFO] Fetching {name} from {path}")
-        paginate_collect(headers, base_url, path, params, args.page_size, container_key,
-                         outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
-                         max_pages=args.max_pages, raw_json=args.raw_json)
-        # We don't cache payloads in-memory (large). Disk is the source of truth for children.
-        if name in parents:
-            cache[name] = [{"payload": {}}]  # sentinel for expansions
+        paginate_collect(
+            headers, base_url, path, params, args.page_size, container_key,
+            outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
+            max_pages=args.max_pages, raw_json=args.raw_json
+        )
 
+    # Write or update manifest
     manifest = {
         "base_url": base_url,
-        "generated_at_utc": datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z"),
+        "generated_at_utc": utcnow_iso(),
         "page_size": args.page_size,
         "endpoints": endpoints,
+        "raw_json": bool(args.raw_json),
+        "resume_cutoff_index": last_done_idx,
     }
-    with (outdir / "manifest.json").open("w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-
+    (outdir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Done. Export written to: {outdir}")
+
 
 if __name__ == "__main__":
     main()
