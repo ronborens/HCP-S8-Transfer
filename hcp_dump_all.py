@@ -7,9 +7,16 @@ Usage:
     python hcp_dump_all.py --only jobs --out ./hcp_export
 
 Env:
-    HCP_API_KEY           required
-    HCP_BASE_URL          optional, defaults to https://api.housecallpro.com
-    HCP_DISABLE_PRICE_BOOK=1 to skip price book endpoints
+    HCP_API_KEY                     required
+    HCP_BASE_URL                    optional, defaults to https://api.housecallpro.com
+
+    # Optional feature toggles (all generic; no hardcoding of specific endpoints)
+    HCP_DISABLE_GROUPS              CSV of endpoint groups to skip, e.g. "api/price_book,leads"
+    HCP_DISABLE_ENDPOINTS           CSV of endpoint names to skip, e.g. "materials_from_categories,invoices"
+    HCP_SKIP_ERROR_SUBSTRINGS       CSV of substrings; if HTTP error body contains any, skip that single-object child row
+                                    e.g. "archived job,customer inactive,already deleted"
+    HCP_TREAT_404_AS_SKIP_GROUPS    CSV of groups where a 404 should skip the whole endpoint (not crash)
+                                    e.g. "api/price_book,booking_windows"
 
 Notes:
     - Set HCP_API_KEY via a .env file if desired (python-dotenv supported).
@@ -138,7 +145,6 @@ def compute_resume_cutoff(outdir: pathlib.Path, ordered_names: List[str]) -> int
             last_done = i
     return last_done
 
-
 def utcnow_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -237,6 +243,46 @@ def read_parent_items_from_ndjson(outdir: pathlib.Path, parent_name: str) -> Ite
                     yield obj
             except Exception:
                 continue
+
+# -------- General grouping, skipping, and error policies --------
+
+def endpoint_group(ep: dict) -> str:
+    """
+    Group endpoints by feature so a single auth failure disables the whole family.
+    Priority:
+      1) explicit 'group' field in endpoint spec (if present)
+      2) '/api/<feature>/...' -> 'api/<feature>'
+      3) first path segment, e.g. '/jobs' -> 'jobs'
+    """
+    if ep.get("group"):
+        return str(ep["group"])
+    path = str(ep.get("path", "/")).lstrip("/")
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[0] == "api":
+        return f"api/{parts[1]}"
+    return parts[0] if parts else ""
+
+def parse_csv_env(name: str) -> set:
+    raw = os.getenv(name, "") or ""
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+def is_authz_error(exc: requests.exceptions.HTTPError) -> bool:
+    resp = getattr(exc, "response", None)
+    return bool(resp) and resp.status_code in (401, 403)
+
+def is_not_found_error(exc: requests.exceptions.HTTPError) -> bool:
+    resp = getattr(exc, "response", None)
+    return bool(resp) and resp.status_code == 404
+
+def matches_skip_text(exc: requests.exceptions.HTTPError, substrings: Iterable[str]) -> bool:
+    resp = getattr(exc, "response", None)
+    if not resp or not substrings:
+        return False
+    body = (resp.text or "").lower()
+    return any(s.lower() in body for s in substrings)
+
+def should_skip_endpoint_due_to_group(ep: dict, disabled_groups: set) -> bool:
+    return endpoint_group(ep) in disabled_groups
 
 # ---------------- HTTP ----------------
 
@@ -358,6 +404,7 @@ def expand_child_collection(
     max_pages: Optional[int],
     parent_container_key: Optional[str],
     raw_json: bool,
+    summary_tracker: Optional[Dict[str, Any]] = None,
 ) -> None:
     id_field = child_def.get("id_field", "id")
     child_name = child_def["name"]
@@ -382,6 +429,9 @@ def expand_child_collection(
             raw_dir_single = outdir / "raw" / child_name
             ensure_dir(raw_dir_single)
 
+    # env-configurable skip reasons for single-object calls
+    skip_substrings = parse_csv_env("HCP_SKIP_ERROR_SUBSTRINGS")
+
     for idx, it in enumerate(parents, 1):
         if id_field not in it:
             continue
@@ -394,12 +444,18 @@ def expand_child_collection(
             try:
                 payload, _ = robust_get(url, encode_params(call_params), session_headers)
             except requests.exceptions.HTTPError as e:
-                text = e.response.text.lower() if e.response is not None else ""
-                if e.response is not None and e.response.status_code in (400, 404) and "archived job" in text:
-                    print(f"[WARN] Skipping archived parent {parent_id} for {child_name}")
+                # Generic skip-once rules:
+                # - 404: often means no child object exists
+                # - error text contains any configured substrings
+                if is_not_found_error(e) or matches_skip_text(e, skip_substrings):
+                    print(f"[WARN] Skipping {child_name} for parent {parent_id} due to {getattr(e.response, 'status_code', None)} / matched skip text")
+                    if summary_tracker is not None:
+                        summary_tracker.setdefault("child_skips", {}).setdefault(child_name, 0)
+                        summary_tracker["child_skips"][child_name] += 1
                     continue
-                else:
-                    raise
+                # Anything else: bubble up so the caller can decide (may disable group on 401/403)
+                raise
+
             if raw_json and raw_dir_single:
                 (raw_dir_single / f"{parent_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             write_ndjson_line(nd_path, payload, container_key=container_key)
@@ -452,7 +508,7 @@ def main() -> None:
     args = ap.parse_args()
 
     out_root = pathlib.Path(args.out).resolve()
-    # Important: choose the folder we will actually WRITE INTO
+    # Choose the folder to WRITE INTO
     outdir = resolve_outdir(out_root, args.resume)
     ensure_dir(outdir)
 
@@ -472,9 +528,6 @@ def main() -> None:
         if not endpoints:
             sys.exit(f"--only '{args.only}' did not match any endpoint")
 
-    if os.getenv("HCP_DISABLE_PRICE_BOOK", "0") == "1":
-        endpoints = [ep for ep in endpoints if not ep["path"].startswith("/api/price_book/")]
-
     # Normalize page size on every endpoint (if not set explicitly)
     normalized: List[Dict[str, Any]] = []
     for ep in endpoints:
@@ -485,61 +538,103 @@ def main() -> None:
         normalized.append(ep)
     endpoints = normalized
 
-    # Ordered list of endpoint NAMES for resume cutoff semantics
+    # Resume cutoff
     ordered_names = [ep["name"] for ep in endpoints]
-
-    # Compute resume cutoff index based on existing NDJSON in the chosen outdir
     last_done_idx = compute_resume_cutoff(outdir, ordered_names) if args.resume else -1
     if args.resume and last_done_idx >= 0:
         print(f"[INFO] Resume enabled. Detected progress up to '{ordered_names[last_done_idx]}' (index {last_done_idx}).")
         print("[INFO] All endpoints at or before that index will be skipped.")
 
-    # We’ll need this to locate parents for child expansions
-    parents = {ep["expand_from"] for ep in endpoints if "expand_from" in ep}
+    # Generic disables
+    disabled_groups: set[str] = set()
+    disabled_groups |= parse_csv_env("HCP_DISABLE_GROUPS")  # e.g. api/price_book
+    disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")  # by endpoint name
 
+    if disabled_endpoints:
+        endpoints = [ep for ep in endpoints if ep.get("name") not in disabled_endpoints]
+
+    # Tracking for end-of-run summary
+    summary = {
+        "skipped_due_to_resume": [],
+        "skipped_due_to_group": [],
+        "skipped_due_to_404_policy": [],
+        "child_skips": {},  # child_name -> count
+        "auth_failures": [],  # (endpoint, group, status)
+        "processed_endpoints": [],
+    }
+
+    # Process endpoints
     for idx, ep in enumerate(endpoints):
         name = ep["name"]
-        if args.resume and idx <= last_done_idx:
-            print(f"[SKIP] {name} (resume cutoff reached at index {last_done_idx})")
-            continue
-
         path = ep["path"]
         params = ep.get("params", {})
         container_key = ep.get("container_key")
+        group = endpoint_group(ep)
 
-        if "expand_from" in ep:
-            parent_name = ep["expand_from"]
-            parent_def = next((e for e in endpoints if e["name"] == parent_name and "expand_from" not in e), None)
-            if not parent_def:
-                parent_def = next((e for e in DEFAULT_ENDPOINTS if e["name"] == parent_name and "expand_from" not in e), None)
-            if not parent_def:
-                print(f"[WARN] Missing parent definition for '{parent_name}', skipping child '{name}'")
-                continue
-
-            # Ensure parent listing exists before we expand
-            parent_ck = parent_def.get("container_key")
-            parent_out_exists = (outdir / f"{parent_name}.ndjson").exists() or (outdir / "raw" / parent_name).exists()
-            if not parent_out_exists:
-                print(f"[INFO] Fetching parent listing '{parent_name}' from {parent_def['path']}")
-                paginate_collect(
-                    headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
-                    parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
-                    max_pages=args.max_pages, raw_json=args.raw_json
-                )
-
-            print(f"[INFO] Expanding child collection {name} via {parent_name}")
-            expand_child_collection(
-                headers, base_url, parent_name, ep, args.page_size, outdir, args.resume, args.delay_ms,
-                args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json
-            )
+        if args.resume and idx <= last_done_idx:
+            print(f"[SKIP] {name} (resume cutoff reached at index {last_done_idx})")
+            summary["skipped_due_to_resume"].append(name)
             continue
 
-        print(f"[INFO] Fetching {name} from {path}")
-        paginate_collect(
-            headers, base_url, path, params, args.page_size, container_key,
-            outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
-            max_pages=args.max_pages, raw_json=args.raw_json
-        )
+        if should_skip_endpoint_due_to_group(ep, disabled_groups):
+            print(f"[SKIP] {name} (group '{group}' disabled)")
+            summary["skipped_due_to_group"].append({"name": name, "group": group})
+            continue
+
+        try:
+            if "expand_from" in ep:
+                parent_name = ep["expand_from"]
+                parent_def = next((e for e in endpoints if e["name"] == parent_name and "expand_from" not in e), None) \
+                             or next((e for e in DEFAULT_ENDPOINTS if e["name"] == parent_name and "expand_from" not in e), None)
+                if not parent_def:
+                    print(f"[WARN] Missing parent definition for '{parent_name}', skipping child '{name}'")
+                    summary["skipped_due_to_group"].append({"name": name, "group": f"missing_parent:{parent_name}"})
+                    continue
+
+                parent_ck = parent_def.get("container_key")
+                parent_out_exists = (outdir / f"{parent_name}.ndjson").exists() or (outdir / "raw" / parent_name).exists()
+                if not parent_out_exists:
+                    print(f"[INFO] Fetching parent listing '{parent_name}' from {parent_def['path']}")
+                    paginate_collect(
+                        headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
+                        parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
+                        max_pages=args.max_pages, raw_json=args.raw_json
+                    )
+
+                print(f"[INFO] Expanding child collection {name} via {parent_name}")
+                expand_child_collection(
+                    headers, base_url, parent_name, ep, args.page_size, outdir, args.resume, args.delay_ms,
+                    args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json, summary_tracker=summary
+                )
+                summary["processed_endpoints"].append(name)
+            else:
+                print(f"[INFO] Fetching {name} from {path}")
+                paginate_collect(
+                    headers, base_url, path, params, args.page_size, container_key,
+                    outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
+                    max_pages=args.max_pages, raw_json=args.raw_json
+                )
+                summary["processed_endpoints"].append(name)
+
+        except requests.exceptions.HTTPError as e:
+            # 401/403: disable entire group for this run and continue
+            if is_authz_error(e):
+                code = getattr(e.response, "status_code", None)
+                print(f"[WARN] {name}: auth failure ({code}). Disabling group '{group}' for this run.")
+                disabled_groups.add(group)
+                summary["auth_failures"].append((name, group, code))
+                summary["skipped_due_to_group"].append({"name": name, "group": group})
+                continue
+
+            # Optional: treat 404 as “skip this endpoint” (not whole group). Opt-in per group via env.
+            treat_404_groups = parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
+            if is_not_found_error(e) and group in treat_404_groups:
+                print(f"[WARN] {name}: 404 Not Found; skipping endpoint (group policy).")
+                summary["skipped_due_to_404_policy"].append({"name": name, "group": group})
+                continue
+
+            # Anything else: fail loud.
+            raise
 
     # Write or update manifest
     manifest = {
@@ -549,10 +644,43 @@ def main() -> None:
         "endpoints": endpoints,
         "raw_json": bool(args.raw_json),
         "resume_cutoff_index": last_done_idx,
+        "disabled_groups": sorted(disabled_groups),
+        "disabled_endpoints": sorted(disabled_endpoints),
+        "skip_error_substrings": sorted(parse_csv_env("HCP_SKIP_ERROR_SUBSTRINGS")),
+        "treat_404_as_skip_groups": sorted(parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")),
+        "summary": summary,
     }
     (outdir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Done. Export written to: {outdir}")
 
+    # ------------ End-of-run concise summary (printed) ------------
+    print("\n=== Run Summary ===")
+    print(f"Output dir: {outdir}")
+    print(f"Processed endpoints ({len(summary['processed_endpoints'])}): {', '.join(summary['processed_endpoints']) or '-'}")
+
+    if summary["skipped_due_to_resume"]:
+        print(f"Skipped due to resume ({len(summary['skipped_due_to_resume'])}): {', '.join(summary['skipped_due_to_resume'])}")
+    if summary["skipped_due_to_group"]:
+        grouped = {}
+        for item in summary["skipped_due_to_group"]:
+            grouped.setdefault(item['group'], []).append(item['name'])
+        for grp, names in grouped.items():
+            print(f"Skipped by disabled group '{grp}' ({len(names)}): {', '.join(names)}")
+    if summary["skipped_due_to_404_policy"]:
+        grouped_404 = {}
+        for item in summary["skipped_due_to_404_policy"]:
+            grouped_404.setdefault(item['group'], []).append(item['name'])
+        for grp, names in grouped_404.items():
+            print(f"Skipped due to 404 policy for group '{grp}' ({len(names)}): {', '.join(names)}")
+    if summary["child_skips"]:
+        for child_name, cnt in summary["child_skips"].items():
+            print(f"Single-object child skips for '{child_name}': {cnt}")
+    if manifest["disabled_groups"]:
+        print(f"Disabled groups this run: {', '.join(manifest['disabled_groups'])}")
+    if summary["auth_failures"]:
+        details = ", ".join([f"{ep} [{grp}] {code}" for ep, grp, code in summary["auth_failures"]])
+        print(f"Auth failures (caused group disable): {details}")
+
+    print("Done.")
 
 if __name__ == "__main__":
     main()
