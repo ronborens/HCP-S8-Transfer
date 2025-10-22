@@ -19,6 +19,12 @@ Env:
     HCP_TREAT_404_AS_SKIP_GROUPS    CSV of groups where a 404 should skip the whole endpoint (not crash)
                                     e.g. "api/price_book,booking_windows"
 
+    # Networking and retry knobs
+    HCP_CONNECT_TIMEOUT             seconds, default 15
+    HCP_READ_TIMEOUT                seconds, default 90
+    HCP_MAX_RETRIES                 total attempts per request, default 8
+    HCP_BACKOFF_MAX                 max sleep between retries, seconds, default 60
+
 Notes:
     - Set HCP_API_KEY via a .env file if desired (python-dotenv supported).
     - Raw JSON is optional. NDJSON is always written.
@@ -38,6 +44,14 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+from requests import Session
+from requests.exceptions import (
+    ReadTimeout,
+    ConnectTimeout,
+    ConnectionError as ReqConnectionError,
+    ChunkedEncodingError,
+)
+from urllib3.exceptions import ProtocolError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -148,7 +162,8 @@ def resolve_outdir(out_root: pathlib.Path, resume: bool) -> pathlib.Path:
     # create new timestamp dir
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = out_root / stamp
-    ensure_dir(outdir)
+    ensure_dir(outdir
+    )
     return outdir
 
 def compute_resume_cutoff(outdir: pathlib.Path, ordered_names: List[str]) -> int:
@@ -332,26 +347,75 @@ class NotFoundEndpointError(Exception):
         self.status_code = status_code
         super().__init__(f"{endpoint_name}: not found ({status_code}) in group '{group}'")
 
-# ---------------- HTTP ----------------
+# ---------------- HTTP + Retry ----------------
 
 TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+TRANSIENT_EXC = (ReadTimeout, ConnectTimeout, ReqConnectionError, ChunkedEncodingError, ProtocolError)
 
-def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retries: int = 6) -> Tuple[Optional[Any], requests.Response]:
+def get_timeout_tuple() -> Tuple[float, float]:
+    # (connect, read)
+    connect = float(os.getenv("HCP_CONNECT_TIMEOUT", "15"))
+    read = float(os.getenv("HCP_READ_TIMEOUT", "90"))
+    return (connect, read)
+
+def get_retry_knobs() -> Tuple[int, float]:
+    max_retries = int(os.getenv("HCP_MAX_RETRIES", "8"))
+    backoff_max = float(os.getenv("HCP_BACKOFF_MAX", "60"))
+    return max_retries, backoff_max
+
+_session: Optional[Session] = None
+
+def get_session() -> Session:
+    global _session
+    if _session is None:
+        s = requests.Session()
+        # Let our custom retry/backoff handle logic; keep pool defaults decent
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _session = s
+    return _session
+
+def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retries: Optional[int] = None) -> Tuple[Optional[Any], requests.Response]:
+    """
+    Retries on:
+      - Transient HTTP statuses (408/425/429/5xx)
+      - Network exceptions (timeouts, connection resets, chunked encoding, protocol errors)
+    """
+    if retries is None:
+        retries, backoff_cap = get_retry_knobs()
+    else:
+        _, backoff_cap = get_retry_knobs()
+
+    session = get_session()
+    timeout = get_timeout_tuple()
     backoff = 1.0
-    last: Optional[requests.Response] = None
-    for attempt in range(1, retries + 1):
-        r = requests.get(url, params=params, headers=headers, timeout=60)
+    last_resp: Optional[requests.Response] = None
+    attempt = 0
+
+    while attempt < retries:
+        attempt += 1
+        try:
+            r = session.get(url, params=params, headers=headers, timeout=timeout)
+        except TRANSIENT_EXC as e:
+            sleep_for = min(backoff + random.uniform(0, backoff * 0.25), backoff_cap)
+            print(f"[WARN] Network error on GET {url} ({type(e).__name__}). Attempt {attempt}/{retries}. Sleeping {sleep_for:.1f}s then retrying.")
+            time.sleep(sleep_for)
+            backoff = min(backoff * 2, backoff_cap)
+            continue
+
         if r.status_code in TRANSIENT_STATUSES:
-            last = r
+            last_resp = r
             retry_after = r.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
-                time.sleep(int(retry_after))
+                sleep_for = min(int(retry_after), backoff_cap)
             else:
-                # jitter to reduce thundering herd
-                sleep_for = backoff + random.uniform(0, backoff * 0.25)
-                time.sleep(sleep_for)
-                backoff = min(backoff * 2, 30)
+                sleep_for = min(backoff + random.uniform(0, backoff * 0.25), backoff_cap)
+            print(f"[WARN] Transient HTTP {r.status_code} on {url}. Attempt {attempt}/{retries}. Sleeping {sleep_for:.1f}s.")
+            time.sleep(sleep_for)
+            backoff = min(backoff * 2, backoff_cap)
             continue
+
         if r.status_code >= 400:
             # Emit limited server text for diagnosis, then raise
             try:
@@ -360,19 +424,20 @@ def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retrie
             except Exception:
                 pass
             r.raise_for_status()
+
         try:
             return r.json(), r
         except ValueError:
             return None, r
-    if last is not None:
-        print(f"[ERROR] {last.status_code} {url} :: {last.text[:500]}")
-        last.raise_for_status()
-    raise RuntimeError("robust_get: exhausted retries with no response")
+
+    if last_resp is not None:
+        print(f"[ERROR] Exhausted retries. Last HTTP {last_resp.status_code} for {url} :: {last_resp.text[:500]}")
+        last_resp.raise_for_status()
+    raise RuntimeError(f"robust_get: exhausted {retries} retries with no successful response for {url}")
 
 # ---------------- Content predicates ----------------
 
 def needs_hydration(item: dict, require_keys: List[str]) -> bool:
-    # Hydrate when keys are missing (not present at all). Present-but-empty is accepted as truly empty.
     for k in (require_keys or []):
         if k not in item:
             return True
@@ -389,14 +454,12 @@ def checklist_has_content(obj: dict) -> bool:
     return False
 
 def is_archived_parent_error(exc: requests.exceptions.HTTPError) -> bool:
-    """Detect common archived-parent responses (e.g., HCP 'Archived job')."""
     resp = getattr(exc, "response", None)
     if not resp:
         return False
     if resp.status_code not in (400, 404):
         return False
     txt = (resp.text or "")[:2000].lower()
-    # Be generous but specific enough to avoid false positives
     return ("archived job" in txt) or ("archived" in txt and "job" in txt)
 
 # ---------------- Pagination and expansion ----------------
@@ -533,13 +596,11 @@ def expand_child_collection(
         path = child_def["path"].replace("{id}", str(parent_id))
 
         if single_object:
-            # True single-object: write the whole payload once (envelope allowed)
             try:
                 payload, _ = robust_get(f"{base_url}{path}", encode_params(call_params), session_headers)
             except requests.exceptions.HTTPError as e:
                 code = getattr(e.response, "status_code", None)
 
-                # Fast-forward for archived jobs if these parents are 'jobs'
                 if listing_name == "jobs" and is_archived_parent_error(e):
                     print(f"[WARN] {child_name}: encountered archived job at parent {parent_id} "
                           f"(HTTP {code}). Fast-forwarding remaining parents and moving to next endpoint.")
@@ -547,9 +608,8 @@ def expand_child_collection(
                         summary_tracker.setdefault("fast_forwarded_due_to_archived", {}) \
                                        .setdefault(child_name, 0)
                         summary_tracker["fast_forwarded_due_to_archived"][child_name] += 1
-                    break  # exit parent loop; continue with next endpoint
+                    break
 
-                # Benign skip-once (404 or matched skip substrings)
                 if is_not_found_error(e) or matches_skip_text(e, skip_substrings):
                     print(f"[WARN] Skipping {child_name} for parent {parent_id} due to {code} / matched skip policy")
                     if summary_tracker is not None:
@@ -557,7 +617,6 @@ def expand_child_collection(
                         summary_tracker["child_skips"][child_name] += 1
                     continue
 
-                # Anything else: bubble up
                 raise
 
             if raw_json and raw_dir_single:
@@ -620,7 +679,6 @@ def expand_child_collection(
 
                         # Optional filter: for checklist endpoints, only keep non-empty when switch is on
                         if checklists_non_empty_only and "checklists" in child_name:
-                            # If missing required keys, try to hydrate first before deciding emptiness
                             obj_to_write = item
                             if needs_hydration(item, require_keys):
                                 cid = item.get(detail_id_field)
@@ -656,15 +714,12 @@ def expand_child_collection(
                                         out_f.write(json.dumps(detail, ensure_ascii=False) + "\n")
                                         continue
                                 except requests.exceptions.HTTPError:
-                                    # fall through to write item if detail fails
                                     pass
                         out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
                 if len(items) < page_size:
                     break
                 page += 1
-
-            # Optionally dump raw listing pages per parent in hydration mode too (skipped here to save space)
 
 def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:
     if not isinstance(spec, list):
@@ -736,8 +791,7 @@ def main() -> None:
     # Generic disables
     disabled_groups: set[str] = set() | parse_csv_env("HCP_DISABLE_GROUPS")
     disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")
-    # Reasonable defaults for 404-skip groups; merge with env
-    default_404_groups = {"api/price_book"}
+    default_404_groups = {"api/price_book"}  # extend if you want others to skip on 404 by default
     disabled_404_groups = set() | parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
     os.environ["HCP_TREAT_404_AS_SKIP_GROUPS"] = ",".join(sorted(default_404_groups | disabled_404_groups))
     if disabled_endpoints:
