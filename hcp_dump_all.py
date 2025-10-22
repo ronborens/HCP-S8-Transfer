@@ -5,12 +5,13 @@ Housecall Pro data dump (GET-only) — API Key auth
 Usage:
     python hcp_dump_all.py --out ./hcp_export [--resume] [--delay-ms 200]
     python hcp_dump_all.py --only jobs --out ./hcp_export
+    python hcp_dump_all.py --resume --checklists-non-empty-only
 
 Env:
     HCP_API_KEY                     required
     HCP_BASE_URL                    optional, defaults to https://api.housecallpro.com
 
-    # Optional feature toggles (all generic; no hardcoding of specific endpoints)
+    # Optional feature toggles (generic)
     HCP_DISABLE_GROUPS              CSV of endpoint groups to skip, e.g. "api/price_book,leads"
     HCP_DISABLE_ENDPOINTS           CSV of endpoint names to skip, e.g. "materials_from_categories,invoices"
     HCP_SKIP_ERROR_SUBSTRINGS       CSV of substrings; if HTTP error body contains any, skip that single-object child row
@@ -52,7 +53,7 @@ DEFAULT_ENDPOINTS: List[Dict[str, Any]] = [
     # Jobs with expansions included directly
     {"name": "jobs", "path": "/jobs", "params": {"page_size": DEFAULT_PAGE_SIZE, "expand": ["attachments", "appointments"]}, "container_key": "jobs"},
 
-    # Children from jobs
+    # Children from jobs (single-object)
     {"name": "appointments_from_jobs", "path": "/jobs/{id}/appointments", "expand_from": "jobs", "id_field": "id",
      "params": {}, "container_key": "appointments", "single_object": True},
 
@@ -62,36 +63,53 @@ DEFAULT_ENDPOINTS: List[Dict[str, Any]] = [
     {"name": "job_types", "path": "/job_fields/job_types", "params": {}, "container_key": "job_types"},
 
     {"name": "leads", "path": "/leads", "params": {}, "container_key": "leads"},
-
     {"name": "lead_sources", "path": "/lead_sources", "params": {}, "container_key": "lead_sources"},
 
+    # Price book (may be permissioned; grouped by 'api/price_book')
     {"name": "material_categories", "path": "/api/price_book/material_categories", "params": {}, "container_key": "data"},
-
-    # Paginated child off categories
     {"name": "materials_from_categories", "path": "/api/price_book/materials", "expand_from": "material_categories", "id_field": "uuid",
      "params": {"material_category_uuid": "{uuid}"}, "container_key": "data"},
-
     {"name": "price_forms", "path": "/api/price_book/price_forms", "params": {}, "container_key": "data"},
 
+    # Company
     {"name": "company", "path": "/company", "params": {}, "single_object": True, "container_key": None},
-
     {"name": "schedule_availability", "path": "/company/schedule_availability", "params": {}, "single_object": True, "container_key": None},
-
     {"name": "booking_windows", "path": "/company/schedule_availability/booking_windows", "params": {}, "container_key": "booking_windows"},
 
     {"name": "events", "path": "/events", "params": {}, "container_key": "events"},
-
     {"name": "tags", "path": "/tags", "params": {}, "container_key": "tags"},
 
     {"name": "invoices", "path": "/invoices", "params": {}, "container_key": "invoices"},
-
     {"name": "estimates", "path": "/estimates", "params": {}, "container_key": "estimates"},
 
-    # Checklist expansions
-    {"name": "checklists_from_jobs", "path": "/checklists", "expand_from": "jobs", "id_field": "id",
-     "params": {"job_uuids": ["{id}"]}, "container_key": "checklists"},
-    {"name": "checklists_from_estimates", "path": "/checklists", "expand_from": "estimates", "id_field": "id",
-     "params": {"estimate_uuids": ["{id}"]}, "container_key": "checklists"},
+    # Checklists
+    {
+        "name": "checklists_from_jobs",
+        "path": "/checklists",
+        "expand_from": "jobs",
+        "id_field": "id",
+        "params": {"job_uuids": ["{id}"]},
+        "container_key": "checklists",
+        # Optional hydration: if listing omits required fields, fetch detail per checklist id
+        "hydrate": {
+            "path": "/checklists/{id}",
+            "id_field": "id",
+            "require_keys": ["sections"]  # hydrate only if key(s) missing (not when empty)
+        }
+    },
+    {
+        "name": "checklists_from_estimates",
+        "path": "/checklists",
+        "expand_from": "estimates",
+        "id_field": "id",
+        "params": {"estimate_uuids": ["{id}"]},
+        "container_key": "checklists",
+        "hydrate": {
+            "path": "/checklists/{id}",
+            "id_field": "id",
+            "require_keys": ["sections"]
+        }
+    },
 
     {"name": "payments", "path": "/payments", "params": {}, "container_key": "payments"},
 ]
@@ -140,8 +158,7 @@ def compute_resume_cutoff(outdir: pathlib.Path, ordered_names: List[str]) -> int
     """
     last_done = -1
     for i, name in enumerate(ordered_names):
-        nd = outdir / f"{name}.ndjson"
-        if nd.exists():
+        if (outdir / f"{name}.ndjson").exists():
             last_done = i
     return last_done
 
@@ -158,7 +175,6 @@ def get_base_url() -> str:
     return os.getenv("HCP_BASE_URL", "https://api.housecallpro.com").rstrip("/")
 
 def encode_params(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Encode list params with [] suffix and pass through scalars."""
     out: Dict[str, Any] = {}
     for k, v in (params or {}).items():
         if isinstance(v, list):
@@ -227,7 +243,6 @@ def write_ndjson_line(
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         elif isinstance(payload, dict) and payload:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
 
 def read_parent_items_from_raw(outdir: pathlib.Path, parent_name: str, parent_container_key: Optional[str]) -> Iterable[Dict[str, Any]]:
     raw_dir = outdir / "raw" / parent_name
@@ -299,6 +314,24 @@ def matches_skip_text(exc: requests.exceptions.HTTPError, substrings: Iterable[s
 def should_skip_endpoint_due_to_group(ep: dict, disabled_groups: set) -> bool:
     return endpoint_group(ep) in disabled_groups
 
+# ---------------- Exceptions ----------------
+
+class AuthzError(Exception):
+    """Raised when an endpoint call returns 401/403 (authorization)."""
+    def __init__(self, endpoint_name: str, group: str, status_code: int):
+        self.endpoint_name = endpoint_name
+        self.group = group
+        self.status_code = status_code
+        super().__init__(f"{endpoint_name}: auth failure ({status_code}) in group '{group}'")
+
+class NotFoundEndpointError(Exception):
+    """Raised when an endpoint returns 404 and policy allows skipping the endpoint."""
+    def __init__(self, endpoint_name: str, group: str, status_code: int = 404):
+        self.endpoint_name = endpoint_name
+        self.group = group
+        self.status_code = status_code
+        super().__init__(f"{endpoint_name}: not found ({status_code}) in group '{group}'")
+
 # ---------------- HTTP ----------------
 
 TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
@@ -336,6 +369,25 @@ def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retrie
         last.raise_for_status()
     raise RuntimeError("robust_get: exhausted retries with no response")
 
+# ---------------- Content predicates ----------------
+
+def needs_hydration(item: dict, require_keys: List[str]) -> bool:
+    # Hydrate when keys are missing (not present at all). Present-but-empty is accepted as truly empty.
+    for k in (require_keys or []):
+        if k not in item:
+            return True
+    return False
+
+def checklist_has_content(obj: dict) -> bool:
+    secs = obj.get("sections") or []
+    if not isinstance(secs, list) or not secs:
+        return False
+    for s in secs:
+        items = (s or {}).get("items") or []
+        if isinstance(items, list) and items:
+            return True
+    return False
+
 # ---------------- Pagination and expansion ----------------
 
 def paginate_collect(
@@ -352,9 +404,14 @@ def paginate_collect(
     max_pages: Optional[int],
     raw_json: bool,
     parent_dir_suffix: Optional[str] = None,
+    current_group: Optional[str] = None,
 ) -> int:
     """
     Returns the number of pages fetched.
+    Raises:
+      - AuthzError on 401/403 (so caller can disable the group and continue)
+      - NotFoundEndpointError on 404 if policy says to skip this group on 404
+      - requests.exceptions.HTTPError for other HTTP errors
     """
     assert not resume or (outdir is not None and name is not None), "resume requires outdir and name"
 
@@ -365,6 +422,9 @@ def paginate_collect(
         ensure_dir(raw_dir)
 
     nd_path = outdir / f"{name}.ndjson" if outdir and name else None
+
+    # Policy: treat 404 as skip for these groups
+    treat_404_groups = parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
 
     pages_fetched = 0
     page = 1
@@ -378,7 +438,16 @@ def paginate_collect(
         params.setdefault("page_size", page_size)
 
         url = f"{base_url}{path}"
-        payload, resp = robust_get(url, encode_params(params), session_headers)
+        try:
+            payload, resp = robust_get(url, encode_params(params), session_headers)
+        except requests.exceptions.HTTPError as e:
+            code = getattr(e.response, "status_code", None)
+            if code in (401, 403):
+                raise AuthzError(name or path, current_group or "", int(code or 0)) from e
+            if code == 404 and current_group in treat_404_groups:
+                raise NotFoundEndpointError(name or path, current_group or "", 404) from e
+            raise
+
         if resp.status_code == 204:
             break
 
@@ -387,17 +456,15 @@ def paginate_collect(
             raw_file = raw_dir / f"page_{page}.json"
             raw_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Append to NDJSON
+        # Collections: write rows only
         write_ndjson_line(nd_path, payload, container_key, allow_envelope=False)
 
-        # Stop conditions
+        # Stop conditions based on items
         items, _ = extract_items(payload, container_key)
         count = len(items)
         if count == 0:
             break
         pages_fetched += 1
-
-        # Heuristic: many APIs stop returning a full page on the last page
         if count < params["page_size"]:
             break
 
@@ -420,11 +487,13 @@ def expand_child_collection(
     parent_container_key: Optional[str],
     raw_json: bool,
     summary_tracker: Optional[Dict[str, Any]] = None,
+    checklists_non_empty_only: bool = False,
 ) -> None:
     id_field = child_def.get("id_field", "id")
     child_name = child_def["name"]
     container_key = child_def.get("container_key")
     single_object = child_def.get("single_object", False)
+    group = endpoint_group(child_def)
 
     # Prefer RAW parents if present; fall back to NDJSON
     parents = list(read_parent_items_from_raw(outdir, listing_name, parent_container_key))
@@ -471,33 +540,107 @@ def expand_child_collection(
                 (raw_dir_single / f"{parent_id}.json").write_text(
                     json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
-            # Allow envelope/object for single-object endpoints
             write_ndjson_line(nd_path, payload, container_key=container_key, allow_envelope=True)
 
         else:
-            # Paginated child collection per parent
-            parent_suffix = f"{listing_name}_{parent_id}"
-            pages = paginate_collect(
-                session_headers,
-                base_url,
-                path,
-                call_params,
-                page_size,
-                container_key,
-                outdir=outdir,
-                name=child_name,
-                resume=resume,
-                delay_ms=delay_ms,
-                max_pages=max_pages,
-                raw_json=raw_json,
-                parent_dir_suffix=parent_suffix,
-            )
-            # Optional: record parents with no rows in a sparse index file
-            if pages == 0:
-                empty_idx = outdir / f"{child_name}.empty.ndjson"
-                with empty_idx.open("a", encoding="utf-8") as ef:
-                    ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
+            # Collection child; optionally hydrate per item
+            hydrate = child_def.get("hydrate")
+            if not hydrate:
+                parent_suffix = f"{listing_name}_{parent_id}"
+                pages = paginate_collect(
+                    session_headers,
+                    base_url,
+                    path,
+                    call_params,
+                    page_size,
+                    container_key,
+                    outdir=outdir,
+                    name=child_name,
+                    resume=resume,
+                    delay_ms=delay_ms,
+                    max_pages=max_pages,
+                    raw_json=raw_json,
+                    parent_dir_suffix=parent_suffix,
+                    current_group=group,
+                )
+                if pages == 0:
+                    empty_idx = outdir / f"{child_name}.empty.ndjson"
+                    with empty_idx.open("a", encoding="utf-8") as ef:
+                        ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
+                continue
 
+            # Hydration mode: paginate ourselves to inspect rows and optionally fetch details
+            nd_rows_path = outdir / f"{child_name}.ndjson"
+            require_keys = hydrate.get("require_keys") or []
+            detail_path_tmpl = hydrate["path"]
+            detail_id_field = hydrate.get("id_field", "id")
+
+            page = 1
+            while True:
+                params = dict(call_params)
+                params["page"] = page
+                params["page_size"] = page_size
+                payload, _ = robust_get(f"{base_url}{path}", encode_params(params), session_headers)
+                items, _ck = extract_items(payload, container_key)
+                if not items:
+                    if page == 1:
+                        empty_idx = outdir / f"{child_name}.empty.ndjson"
+                        with empty_idx.open("a", encoding="utf-8") as ef:
+                            ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
+                    break
+
+                with nd_rows_path.open("a", encoding="utf-8") as out_f:
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+
+                        # Optional filter: for checklist endpoints, only keep non-empty when switch is on
+                        if checklists_non_empty_only and "checklists" in child_name:
+                            # If missing required keys, try to hydrate first before deciding emptiness
+                            obj_to_write = item
+                            if needs_hydration(item, require_keys):
+                                cid = item.get(detail_id_field)
+                                if cid:
+                                    d_path = detail_path_tmpl.replace("{id}", str(cid))
+                                    try:
+                                        detail, _ = robust_get(f"{base_url}{d_path}", {}, session_headers)
+                                        if isinstance(detail, dict):
+                                            obj_to_write = detail
+                                    except requests.exceptions.HTTPError:
+                                        pass
+                            if checklist_has_content(obj_to_write):
+                                out_f.write(json.dumps(obj_to_write, ensure_ascii=False) + "\n")
+                            else:
+                                ei = outdir / f"{child_name}.empty.ndjson"
+                                with ei.open("a", encoding="utf-8") as ef:
+                                    ef.write(json.dumps({
+                                        "parent": listing_name,
+                                        "parent_id": parent_id,
+                                        "checklist_id": obj_to_write.get("id"),
+                                        "title": obj_to_write.get("title")
+                                    }) + "\n")
+                            continue
+
+                        # Default path: hydrate only if required keys are missing
+                        if needs_hydration(item, require_keys):
+                            cid = item.get(detail_id_field)
+                            if cid:
+                                d_path = detail_path_tmpl.replace("{id}", str(cid))
+                                try:
+                                    detail, _ = robust_get(f"{base_url}{d_path}", {}, session_headers)
+                                    if isinstance(detail, dict):
+                                        out_f.write(json.dumps(detail, ensure_ascii=False) + "\n")
+                                        continue
+                                except requests.exceptions.HTTPError:
+                                    # fall through to write item if detail fails
+                                    pass
+                        out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+                if len(items) < page_size:
+                    break
+                page += 1
+
+            # Optionally dump raw listing pages per parent in hydration mode too (skipped here to save space)
 
 def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:
     if not isinstance(spec, list):
@@ -526,14 +669,14 @@ def main() -> None:
     ap.add_argument("--only", help="Only run a single endpoint by name")
     ap.add_argument("--max-pages", type=int, help="Limit pages fetched per endpoint (testing)")
     ap.add_argument("--raw-json", action="store_true", help="Write raw JSON pages to disk")
+    ap.add_argument("--checklists-non-empty-only", action="store_true",
+                    help="For checklist endpoints, only write rows that have at least one section with items; index empties separately")
     args = ap.parse_args()
 
     out_root = pathlib.Path(args.out).resolve()
-    # Choose the folder to WRITE INTO
     outdir = resolve_outdir(out_root, args.resume)
     ensure_dir(outdir)
 
-    # Load/validate endpoints
     endpoints = DEFAULT_ENDPOINTS
     if args.endpoints_json:
         try:
@@ -567,10 +710,8 @@ def main() -> None:
         print("[INFO] All endpoints at or before that index will be skipped.")
 
     # Generic disables
-    disabled_groups: set[str] = set()
-    disabled_groups |= parse_csv_env("HCP_DISABLE_GROUPS")  # e.g. api/price_book
-    disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")  # by endpoint name
-
+    disabled_groups: set[str] = set() | parse_csv_env("HCP_DISABLE_GROUPS")
+    disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")
     if disabled_endpoints:
         endpoints = [ep for ep in endpoints if ep.get("name") not in disabled_endpoints]
 
@@ -579,12 +720,11 @@ def main() -> None:
         "skipped_due_to_resume": [],
         "skipped_due_to_group": [],
         "skipped_due_to_404_policy": [],
-        "child_skips": {},  # child_name -> count
-        "auth_failures": [],  # (endpoint, group, status)
+        "child_skips": {},
+        "auth_failures": [],
         "processed_endpoints": [],
     }
 
-    # Process endpoints
     for idx, ep in enumerate(endpoints):
         name = ep["name"]
         path = ep["path"]
@@ -602,82 +742,73 @@ def main() -> None:
             summary["skipped_due_to_group"].append({"name": name, "group": group})
             continue
 
-        try:
-            if "expand_from" in ep:
-                parent_name = ep["expand_from"]
-                parent_def = next((e for e in endpoints if e["name"] == parent_name and "expand_from" not in e), None) \
-                             or next((e for e in DEFAULT_ENDPOINTS if e["name"] == parent_name and "expand_from" not in e), None)
-                if not parent_def:
-                    print(f"[WARN] Missing parent definition for '{parent_name}', skipping child '{name}'")
-                    summary["skipped_due_to_group"].append({"name": name, "group": f"missing_parent:{parent_name}"})
+        if "expand_from" in ep:
+            parent_name = ep["expand_from"]
+            parent_def = next((e for e in endpoints if e["name"] == parent_name and "expand_from" not in e), None) \
+                         or next((e for e in DEFAULT_ENDPOINTS if e["name"] == parent_name and "expand_from" not in e), None)
+            if not parent_def:
+                print(f"[WARN] Missing parent definition for '{parent_name}', skipping child '{name}'")
+                summary["skipped_due_to_group"].append({"name": name, "group": f"missing_parent:{parent_name}"})
+                continue
+
+            parent_ck = parent_def.get("container_key")
+            parent_out_exists = (outdir / f"{parent_name}.ndjson").exists() or (outdir / "raw" / parent_name).exists()
+            if not parent_out_exists:
+                print(f"[INFO] Fetching parent listing '{parent_name}' from {parent_def['path']}")
+                try:
+                    paginate_collect(
+                        headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
+                        parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
+                        max_pages=args.max_pages, raw_json=args.raw_json, current_group=endpoint_group(parent_def)
+                    )
+                except AuthzError as ae:
+                    print(f"[WARN] {ae.endpoint_name}: auth failure ({ae.status_code}). Disabling group '{ae.group}' for this run.")
+                    disabled_groups.add(ae.group)
+                    summary["auth_failures"].append((ae.endpoint_name, ae.group, ae.status_code))
+                    summary["skipped_due_to_group"].append({"name": name, "group": ae.group})
+                    continue
+                except NotFoundEndpointError as ne:
+                    print(f"[WARN] {ne.endpoint_name}: 404 Not Found; skipping parent endpoint (group policy '{ne.group}').")
+                    summary["skipped_due_to_404_policy"].append({"name": ne.endpoint_name, "group": ne.group})
                     continue
 
-                parent_ck = parent_def.get("container_key")
-                parent_out_exists = (outdir / f"{parent_name}.ndjson").exists() or (outdir / "raw" / parent_name).exists()
-                if not parent_out_exists:
-                    print(f"[INFO] Fetching parent listing '{parent_name}' from {parent_def['path']}")
-                    try:
-                        paginate_collect(
-                            headers, base_url, parent_def["path"], parent_def.get("params", {}), args.page_size,
-                            parent_ck, outdir=outdir, name=parent_name, resume=args.resume, delay_ms=args.delay_ms,
-                            max_pages=args.max_pages, raw_json=args.raw_json
-                        )
-                    except requests.exceptions.HTTPError as e:
-                        # If we can’t even fetch the parent due to auth, disable the parent’s group and skip this child.
-                        pgroup = endpoint_group(parent_def)
-                        if is_authz_error(e):
-                            code = getattr(e.response, "status_code", None)
-                            print(f"[WARN] {parent_name}: auth failure ({code}). Disabling group '{pgroup}' for this run.")
-                            disabled_groups.add(pgroup)
-                            summary["auth_failures"].append((parent_name, pgroup, code))
-                            summary["skipped_due_to_group"].append({"name": name, "group": pgroup})
-                            continue
-                        # Optional policy: treat 404 as skip endpoint for certain groups
-                        treat_404_groups = parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
-                        if is_not_found_error(e) and pgroup in treat_404_groups:
-                            print(f"[WARN] {parent_name}: 404 Not Found; skipping parent endpoint (group policy).")
-                            summary["skipped_due_to_404_policy"].append({"name": parent_name, "group": pgroup})
-                            continue
-                        raise
-
-                print(f"[INFO] Expanding child collection {name} via {parent_name}")
+            print(f"[INFO] Expanding child collection {name} via {parent_name}")
+            try:
                 expand_child_collection(
                     headers, base_url, parent_name, ep, args.page_size, outdir, args.resume, args.delay_ms,
-                    args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json, summary_tracker=summary
+                    args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json, summary_tracker=summary,
+                    checklists_non_empty_only=args.checklists_non_empty_only
                 )
-                summary["processed_endpoints"].append(name)
-
-            else:
-                print(f"[INFO] Fetching {name} from {path}")
-                paginate_collect(
-                    headers, base_url, path, params, args.page_size, container_key,
-                    outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
-                    max_pages=args.max_pages, raw_json=args.raw_json
-                )
-                summary["processed_endpoints"].append(name)
-
-        except requests.exceptions.HTTPError as e:
-            # 401/403: disable entire group for this run and continue
-            if is_authz_error(e):
-                code = getattr(e.response, "status_code", None)
-                print(f"[WARN] {name}: auth failure ({code}). Disabling group '{group}' for this run.")
-                disabled_groups.add(group)
-                summary["auth_failures"].append((name, group, code))
-                summary["skipped_due_to_group"].append({"name": name, "group": group})
+            except AuthzError as ae:
+                print(f"[WARN] {ae.endpoint_name}: auth failure ({ae.status_code}). Disabling group '{ae.group}' for this run.")
+                disabled_groups.add(ae.group)
+                summary["auth_failures"].append((ae.endpoint_name, ae.group, ae.status_code))
+                summary["skipped_due_to_group"].append({"name": name, "group": ae.group})
                 continue
+            summary["processed_endpoints"].append(name)
+            continue
 
-            # Optional: treat 404 as “skip this endpoint” (not whole group). Opt-in per group via env.
-            treat_404_groups = parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
-            if is_not_found_error(e) and group in treat_404_groups:
-                print(f"[WARN] {name}: 404 Not Found; skipping endpoint (group policy).")
-                summary["skipped_due_to_404_policy"].append({"name": name, "group": group})
-                continue
+        # Regular top-level endpoint
+        print(f"[INFO] Fetching {name} from {path}")
+        try:
+            paginate_collect(
+                headers, base_url, path, params, args.page_size, container_key,
+                outdir=outdir, name=name, resume=args.resume, delay_ms=args.delay_ms,
+                max_pages=args.max_pages, raw_json=args.raw_json, current_group=group
+            )
+            summary["processed_endpoints"].append(name)
+        except AuthzError as ae:
+            print(f"[WARN] {ae.endpoint_name}: auth failure ({ae.status_code}). Disabling group '{ae.group}' for this run.")
+            disabled_groups.add(ae.group)
+            summary["auth_failures"].append((ae.endpoint_name, ae.group, ae.status_code))
+            summary["skipped_due_to_group"].append({"name": name, "group": ae.group})
+            continue
+        except NotFoundEndpointError as ne:
+            print(f"[WARN] {ne.endpoint_name}: 404 Not Found; skipping endpoint (group policy '{ne.group}').")
+            summary["skipped_due_to_404_policy"].append({"name": ne.endpoint_name, "group": ne.group})
+            continue
 
-            # Anything else: fail loud.
-            raise
-
-
-    # Write or update manifest
+    # Write manifest
     manifest = {
         "base_url": base_url,
         "generated_at_utc": utcnow_iso(),
