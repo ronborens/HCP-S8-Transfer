@@ -47,16 +47,31 @@ DEFAULT_BASE_URL = "https://api.servicem8.com/api_1.0"
 STAFF_ENDPOINT = "/staff.json"
 
 TRANSIENT_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
-TRANSIENT_EXC = (ReadTimeout, ConnectTimeout, ReqConnectionError, ChunkedEncodingError, ProtocolError)
+TRANSIENT_EXC = (ReadTimeout, ConnectTimeout, ReqConnectionError,
+                 ChunkedEncodingError, ProtocolError)
+TIMESTAMP_DIR_RE = re.compile(r"^\d{8}T\d{6}Z$")
 
 # ---------------- Utility helpers ----------------
+
+
+def pick_latest_timestamp_subdir(root: pathlib.Path) -> Optional[pathlib.Path]:
+    if not root.exists():
+        return None
+    subs = [p for p in root.iterdir() if p.is_dir()
+            and TIMESTAMP_DIR_RE.match(p.name)]
+    if not subs:
+        return None
+    return sorted(subs, key=lambda p: p.name, reverse=True)[0]
+
 
 def getenv_str(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     return v if (v is not None and v != "") else default
 
+
 def ensure_dir(p: pathlib.Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 
 def load_json_if_exists(p: pathlib.Path, default: Any) -> Any:
     if not p.exists():
@@ -66,9 +81,12 @@ def load_json_if_exists(p: pathlib.Path, default: Any) -> Any:
     except Exception:
         return default
 
+
 def save_json(p: pathlib.Path, obj: Any) -> None:
     ensure_dir(p.parent)
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    p.write_text(json.dumps(obj, ensure_ascii=False,
+                 indent=2), encoding="utf-8")
+
 
 def iter_ndjson_lines(path: pathlib.Path, *, skip: int = 0, limit: Optional[int] = None) -> Iterable[Tuple[int, Dict[str, Any]]]:
     """Yield (line_index, parsed_obj) from an NDJSON file, supporting skip & limit."""
@@ -90,20 +108,45 @@ def iter_ndjson_lines(path: pathlib.Path, *, skip: int = 0, limit: Optional[int]
             if limit is not None and count >= limit:
                 break
 
+
 def only_digits_phone(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     digits = re.sub(r"\D", "", s)
     return digits or None
 
+
 def truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n]
 
+
+def resolve_ndjson_dir(arg: str) -> pathlib.Path:
+    p = pathlib.Path(arg).resolve()
+    if p.exists():
+        # if user pointed at ./hcp_export, try to pick the newest timestamped subdir
+        if p.is_dir() and not TIMESTAMP_DIR_RE.match(p.name):
+            latest = pick_latest_timestamp_subdir(p)
+            return latest or p
+        return p
+
+    # Git Bash “missing backslash” rescue: try to split a trailing timestamp and reinsert a separator
+    m = re.search(r"(\d{8}T\d{6}Z)$", arg)
+    if m:
+        root = pathlib.Path(arg[:m.start()]).resolve()
+        stamp = m.group(1)
+        p2 = root / stamp
+        if p2.exists():
+            return p2
+
+    return p  # will fail later with a clear message
+
 # ---------------- ServiceM8 client ----------------
+
 
 class SM8Client:
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
-        self.base_url = (base_url or getenv_str("SM8_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
+        self.base_url = (base_url or getenv_str(
+            "SM8_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
         self.api_key = api_key or getenv_str("SM8_API_KEY")
         if not self.api_key:
             sys.exit("Missing SM8_API_KEY in environment.")
@@ -147,23 +190,28 @@ class SM8Client:
                 )
             except TRANSIENT_EXC as e:
                 if attempt >= self.max_retries:
-                    print(f"[ERROR] Network error (final): {type(e).__name__}: {e}")
+                    print(
+                        f"[ERROR] Network error (final): {type(e).__name__}: {e}")
                     raise
-                print(f"[WARN] Network error {type(e).__name__} on {url} (attempt {attempt}/{self.max_retries})")
+                print(
+                    f"[WARN] Network error {type(e).__name__} on {url} (attempt {attempt}/{self.max_retries})")
                 self._sleep_backoff(attempt, None)
                 continue
 
             if resp.status_code in TRANSIENT_HTTP_STATUSES:
                 if attempt >= self.max_retries:
-                    print(f"[ERROR] HTTP {resp.status_code} (final) for {url}: {resp.text[:300]}")
+                    print(
+                        f"[ERROR] HTTP {resp.status_code} (final) for {url}: {resp.text[:300]}")
                     resp.raise_for_status()
-                print(f"[WARN] HTTP {resp.status_code} on {url} (attempt {attempt}/{self.max_retries})")
+                print(
+                    f"[WARN] HTTP {resp.status_code} on {url} (attempt {attempt}/{self.max_retries})")
                 self._sleep_backoff(attempt, resp.headers.get("Retry-After"))
                 continue
 
             if resp.status_code >= 400:
                 # Non-retryable
-                print(f"[ERROR] HTTP {resp.status_code} for {url}: {resp.text[:500]}")
+                print(
+                    f"[ERROR] HTTP {resp.status_code} for {url}: {resp.text[:500]}")
                 resp.raise_for_status()
 
             return resp
@@ -187,6 +235,7 @@ class SM8Client:
         return uuid, parsed
 
 # ---------------- Mappers (HCP -> SM8) ----------------
+
 
 def map_employee_hcp_to_sm8(hcp: dict) -> Optional[dict]:
     """
@@ -231,7 +280,8 @@ def map_employee_hcp_to_sm8(hcp: dict) -> Optional[dict]:
     role_default = getenv_str("SM8_ROLE_UUID_DEFAULT")
 
     # Hide from schedule (optional behaviour): if employee cannot see full schedule, hide them by default.
-    hide_from_schedule = 1 if not bool(perms.get("can_see_full_schedule")) else 0
+    hide_from_schedule = 1 if not bool(
+        perms.get("can_see_full_schedule")) else 0
 
     payload = {
         "first": first,
@@ -256,6 +306,7 @@ def map_employee_hcp_to_sm8(hcp: dict) -> Optional[dict]:
 
 # ---------------- Importers ----------------
 
+
 def import_employees(ndjson_path: pathlib.Path, client: SM8Client, *, dry_run: bool, limit: Optional[int], skip: int, mapping_path: pathlib.Path) -> None:
     """
     Import employees.ndjson into ServiceM8 /staff.json.
@@ -277,13 +328,15 @@ def import_employees(ndjson_path: pathlib.Path, client: SM8Client, *, dry_run: b
     for line_idx, hcp_employee in iter_ndjson_lines(ndjson_path, skip=skip, limit=limit):
         hcp_id = str(hcp_employee.get("id", ""))
         if hcp_id and hcp_id in id_map:
-            print(f"[SKIP] HCP employee {hcp_id} already mapped to SM8 {id_map[hcp_id]}")
+            print(
+                f"[SKIP] HCP employee {hcp_id} already mapped to SM8 {id_map[hcp_id]}")
             skipped += 1
             continue
 
         payload = map_employee_hcp_to_sm8(hcp_employee)
         if payload is None:
-            print(f"[WARN] Missing required fields (email) at file line {line_idx+1}; skipping")
+            print(
+                f"[WARN] Missing required fields (email) at file line {line_idx+1}; skipping")
             skipped += 1
             continue
 
@@ -305,12 +358,15 @@ def import_employees(ndjson_path: pathlib.Path, client: SM8Client, *, dry_run: b
             continue
 
         try:
-            sm8_uuid, _resp_json = client.create_record(STAFF_ENDPOINT, payload)
+            sm8_uuid, _resp_json = client.create_record(
+                STAFF_ENDPOINT, payload)
             if not sm8_uuid:
                 # Some responses might not include UUID; treat as success but warn.
-                print(f"[WARN] Created staff but no UUID returned for HCP {hcp_id} (check ServiceM8).")
+                print(
+                    f"[WARN] Created staff but no UUID returned for HCP {hcp_id} (check ServiceM8).")
             else:
-                print(f"[OK] Created staff {sm8_uuid} for HCP {hcp_id or '(unknown id)'}")
+                print(
+                    f"[OK] Created staff {sm8_uuid} for HCP {hcp_id or '(unknown id)'}")
 
             if hcp_id:
                 id_map[hcp_id] = sm8_uuid or "unknown"
@@ -325,36 +381,56 @@ def import_employees(ndjson_path: pathlib.Path, client: SM8Client, *, dry_run: b
             errors += 1
             code = getattr(e.response, "status_code", None)
             body = getattr(e.response, "text", "") or ""
-            print(f"[ERROR] Failed to create staff for HCP {hcp_id or '(unknown)'} :: HTTP {code} :: {body[:300]}")
+            print(
+                f"[ERROR] Failed to create staff for HCP {hcp_id or '(unknown)'} :: HTTP {code} :: {body[:300]}")
 
     # Final save of id_map
     save_json(mapping_path, id_map)
 
-    print(f"[DONE] Employees import complete. created={created}, skipped={skipped}, errors={errors}")
+    print(
+        f"[DONE] Employees import complete. created={created}, skipped={skipped}, errors={errors}")
     print(f"[INFO] Mapping saved to: {mapping_path}")
 
 # ---------------- Main ----------------
 
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Import Housecall Pro NDJSON → ServiceM8")
-    ap.add_argument("--ndjson-dir", required=True, help="Directory containing NDJSON files from HCP export")
-    ap.add_argument("--only", default="employees", choices=["employees"], help="Which entity to import (default: employees)")
-    ap.add_argument("--dry-run", action="store_true", help="Simulate without creating records")
-    ap.add_argument("--limit", type=int, help="Limit number of rows to import (testing)")
-    ap.add_argument("--skip", type=int, default=0, help="Skip the first N NDJSON rows (resume-ish)")
-    ap.add_argument("--mapping-out", help="Where to write/read the HCP→SM8 id map (default: ./sm8_mappings/staff_map.json)")
+    ap = argparse.ArgumentParser(
+        description="Import Housecall Pro NDJSON → ServiceM8")
+    ap.add_argument("--ndjson-dir", required=True,
+                    help="Directory containing NDJSON files from HCP export")
+    ap.add_argument("--only", default="employees",
+                    choices=["employees"], help="Which entity to import (default: employees)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Simulate without creating records")
+    ap.add_argument("--limit", type=int,
+                    help="Limit number of rows to import (testing)")
+    ap.add_argument("--skip", type=int, default=0,
+                    help="Skip the first N NDJSON rows (resume-ish)")
+    ap.add_argument(
+        "--mapping-out", help="Where to write/read the HCP→SM8 id map (default: ./sm8_mappings/staff_map.json)")
+    ap.add_argument("--latest", action="store_true",
+                    help="Use newest timestamped subfolder under --ndjson-dir")
+
     args = ap.parse_args()
 
-    ndjson_dir = pathlib.Path(args.ndjson_dir).resolve()
+    ndjson_dir = resolve_ndjson_dir(args.ndjson_dir)
+    if args.latest and ndjson_dir.exists() and ndjson_dir.is_dir() and not TIMESTAMP_DIR_RE.match(ndjson_dir.name):
+        latest = pick_latest_timestamp_subdir(ndjson_dir)
+        if latest:
+            ndjson_dir = latest
+            
     if not ndjson_dir.exists():
-        sys.exit(f"NDJSON dir not found: {ndjson_dir}")
+        sys.exit(f"NDJSON dir not found: {ndjson_dir}\n"
+                 f"HINT (Git Bash): use forward slashes (e.g. hcp_export/2025...) or quote the path.")
 
     # Build client
     client = SM8Client()
 
     # Paths
     employees_file = ndjson_dir / "employees.ndjson"
-    mapping_path = pathlib.Path(args.mapping_out) if args.mapping_out else pathlib.Path("./sm8_mappings/staff_map.json")
+    mapping_path = pathlib.Path(args.mapping_out) if args.mapping_out else pathlib.Path(
+        "./sm8_mappings/staff_map.json")
 
     if args.only == "employees":
         import_employees(
@@ -367,6 +443,7 @@ def main() -> None:
         )
     else:
         print("[INFO] Nothing to do (unknown entity).")
+
 
 if __name__ == "__main__":
     main()
