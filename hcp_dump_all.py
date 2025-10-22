@@ -712,6 +712,9 @@ def main() -> None:
     # Generic disables
     disabled_groups: set[str] = set() | parse_csv_env("HCP_DISABLE_GROUPS")
     disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")
+    default_404_groups = {"api/price_book", "checklists"}
+    disabled_404_groups = set() | parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
+    os.environ["HCP_TREAT_404_AS_SKIP_GROUPS"] = ",".join(sorted(default_404_groups | disabled_404_groups))
     if disabled_endpoints:
         endpoints = [ep for ep in endpoints if ep.get("name") not in disabled_endpoints]
 
