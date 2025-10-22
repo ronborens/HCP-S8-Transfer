@@ -19,6 +19,9 @@ Env:
     HCP_TREAT_404_AS_SKIP_GROUPS    CSV of groups where a 404 should skip the whole endpoint (not crash)
                                     e.g. "api/price_book,booking_windows"
 
+    # Archived parents
+    HCP_ARCHIVED_JOB_FAST_FORWARD   1 to break a jobs-child loop on first archived-job hit (default 1)
+
     # Networking and retry knobs
     HCP_CONNECT_TIMEOUT             seconds, default 15
     HCP_READ_TIMEOUT                seconds, default 90
@@ -104,11 +107,10 @@ DEFAULT_ENDPOINTS: List[Dict[str, Any]] = [
         "id_field": "id",
         "params": {"job_uuids": ["{id}"]},
         "container_key": "checklists",
-        # Optional hydration: if listing omits required fields, fetch detail per checklist id
         "hydrate": {
             "path": "/checklists/{id}",
             "id_field": "id",
-            "require_keys": ["sections"]  # hydrate only if key(s) missing (not when empty)
+            "require_keys": ["sections"]
         }
     },
     {
@@ -139,18 +141,9 @@ def list_timestamp_dirs(root: pathlib.Path) -> List[pathlib.Path]:
     for child in root.iterdir():
         if child.is_dir() and TIMESTAMP_DIR_RE.match(child.name):
             out.append(child)
-    # sort descending (newest first)
     return sorted(out, key=lambda p: p.name, reverse=True)
 
 def resolve_outdir(out_root: pathlib.Path, resume: bool) -> pathlib.Path:
-    """
-    If resume:
-      - If out_root is an existing run dir containing manifest.json, use it.
-      - Else if out_root contains timestamped run subdirs, use the newest.
-      - Else create a new timestamped subdir.
-    If not resume:
-      - Always create a new timestamped subdir under out_root (may be equal to out_root if user points to a timestamp dir).
-    """
     if resume:
         if (out_root / "manifest.json").exists():
             ensure_dir(out_root)
@@ -158,19 +151,12 @@ def resolve_outdir(out_root: pathlib.Path, resume: bool) -> pathlib.Path:
         runs = list_timestamp_dirs(out_root)
         if runs:
             return runs[0]
-        # fall through to create new
-    # create new timestamp dir
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     outdir = out_root / stamp
-    ensure_dir(outdir
-    )
+    ensure_dir(outdir)
     return outdir
 
 def compute_resume_cutoff(outdir: pathlib.Path, ordered_names: List[str]) -> int:
-    """
-    Return the highest index i for which '<name>.ndjson' exists in outdir.
-    If none exist, return -1.
-    """
     last_done = -1
     for i, name in enumerate(ordered_names):
         if (outdir / f"{name}.ndjson").exists():
@@ -239,7 +225,7 @@ def write_ndjson_line(
     payload: Any,
     container_key: Optional[str],
     *,
-    allow_envelope: bool = False,  # True only for single-object endpoints
+    allow_envelope: bool = False,
 ) -> None:
     if nd_path is None:
         return
@@ -292,13 +278,6 @@ def read_parent_items_from_ndjson(outdir: pathlib.Path, parent_name: str) -> Ite
 # -------- General grouping, skipping, and error policies --------
 
 def endpoint_group(ep: dict) -> str:
-    """
-    Group endpoints by feature so a single auth failure disables the whole family.
-    Priority:
-      1) explicit 'group' field in endpoint spec (if present)
-      2) '/api/<feature>/...' -> 'api/<feature>'
-      3) first path segment, e.g. '/jobs' -> 'jobs'
-    """
     if ep.get("group"):
         return str(ep["group"])
     path = str(ep.get("path", "/")).lstrip("/")
@@ -311,10 +290,6 @@ def parse_csv_env(name: str) -> set:
     raw = os.getenv(name, "") or ""
     return {x.strip() for x in raw.split(",") if x.strip()}
 
-def is_authz_error(exc: requests.exceptions.HTTPError) -> bool:
-    resp = getattr(exc, "response", None)
-    return bool(resp) and resp.status_code in (401, 403)
-
 def is_not_found_error(exc: requests.exceptions.HTTPError) -> bool:
     resp = getattr(exc, "response", None)
     return bool(resp) and resp.status_code == 404
@@ -326,13 +301,9 @@ def matches_skip_text(exc: requests.exceptions.HTTPError, substrings: Iterable[s
     body = (resp.text or "").lower()
     return any(s.lower() in body for s in substrings)
 
-def should_skip_endpoint_due_to_group(ep: dict, disabled_groups: set) -> bool:
-    return endpoint_group(ep) in disabled_groups
-
 # ---------------- Exceptions ----------------
 
 class AuthzError(Exception):
-    """Raised when an endpoint call returns 401/403 (authorization)."""
     def __init__(self, endpoint_name: str, group: str, status_code: int):
         self.endpoint_name = endpoint_name
         self.group = group
@@ -340,7 +311,6 @@ class AuthzError(Exception):
         super().__init__(f"{endpoint_name}: auth failure ({status_code}) in group '{group}'")
 
 class NotFoundEndpointError(Exception):
-    """Raised when an endpoint returns 404 and policy allows skipping the endpoint."""
     def __init__(self, endpoint_name: str, group: str, status_code: int = 404):
         self.endpoint_name = endpoint_name
         self.group = group
@@ -353,7 +323,6 @@ TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 TRANSIENT_EXC = (ReadTimeout, ConnectTimeout, ReqConnectionError, ChunkedEncodingError, ProtocolError)
 
 def get_timeout_tuple() -> Tuple[float, float]:
-    # (connect, read)
     connect = float(os.getenv("HCP_CONNECT_TIMEOUT", "15"))
     read = float(os.getenv("HCP_READ_TIMEOUT", "90"))
     return (connect, read)
@@ -369,7 +338,6 @@ def get_session() -> Session:
     global _session
     if _session is None:
         s = requests.Session()
-        # Let our custom retry/backoff handle logic; keep pool defaults decent
         adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=40, max_retries=0)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
@@ -377,11 +345,6 @@ def get_session() -> Session:
     return _session
 
 def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retries: Optional[int] = None) -> Tuple[Optional[Any], requests.Response]:
-    """
-    Retries on:
-      - Transient HTTP statuses (408/425/429/5xx)
-      - Network exceptions (timeouts, connection resets, chunked encoding, protocol errors)
-    """
     if retries is None:
         retries, backoff_cap = get_retry_knobs()
     else:
@@ -417,7 +380,6 @@ def robust_get(url: str, params: Dict[str, Any], headers: Dict[str, str], retrie
             continue
 
         if r.status_code >= 400:
-            # Emit limited server text for diagnosis, then raise
             try:
                 body = r.text[:500]
                 print(f"[ERROR] {r.status_code} {url} :: {body}")
@@ -459,8 +421,8 @@ def is_archived_parent_error(exc: requests.exceptions.HTTPError) -> bool:
         return False
     if resp.status_code not in (400, 404):
         return False
-    txt = (resp.text or "")[:2000].lower()
-    return ("archived job" in txt) or ("archived" in txt and "job" in txt)
+    txt = (resp.text or "").lower()
+    return "archived job" in txt or ("archived" in txt and "job" in txt)
 
 # ---------------- Pagination and expansion ----------------
 
@@ -480,24 +442,14 @@ def paginate_collect(
     parent_dir_suffix: Optional[str] = None,
     current_group: Optional[str] = None,
 ) -> int:
-    """
-    Returns the number of pages fetched.
-    Raises:
-      - AuthzError on 401/403 (so caller can disable the group and continue)
-      - NotFoundEndpointError on 404 if policy says to skip this group on 404
-      - requests.exceptions.HTTPError for other HTTP errors
-    """
     assert not resume or (outdir is not None and name is not None), "resume requires outdir and name"
 
-    # Prepare raw directory
     raw_dir: Optional[pathlib.Path] = None
     if raw_json and outdir and name:
         raw_dir = outdir / "raw" / (name if parent_dir_suffix is None else f"{name}/{parent_dir_suffix}")
         ensure_dir(raw_dir)
 
     nd_path = outdir / f"{name}.ndjson" if outdir and name else None
-
-    # Policy: treat 404 as skip for these groups
     treat_404_groups = parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
 
     pages_fetched = 0
@@ -525,15 +477,12 @@ def paginate_collect(
         if resp.status_code == 204:
             break
 
-        # Write raw page
         if raw_dir:
             raw_file = raw_dir / f"page_{page}.json"
             raw_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Collections: write rows only
         write_ndjson_line(nd_path, payload, container_key, allow_envelope=False)
 
-        # Stop conditions based on items
         items, _ = extract_items(payload, container_key)
         count = len(items)
         if count == 0:
@@ -569,7 +518,6 @@ def expand_child_collection(
     single_object = child_def.get("single_object", False)
     group = endpoint_group(child_def)
 
-    # Prefer RAW parents if present; fall back to NDJSON
     parents = list(read_parent_items_from_raw(outdir, listing_name, parent_container_key))
     if not parents:
         parents = list(read_parent_items_from_ndjson(outdir, listing_name))
@@ -577,7 +525,6 @@ def expand_child_collection(
         print(f"[WARN] No parent items found for '{listing_name}', cannot expand '{child_name}'")
         return
 
-    # Prep single-object outputs
     nd_path: Optional[pathlib.Path] = None
     raw_dir_single: Optional[pathlib.Path] = None
     if single_object:
@@ -587,6 +534,7 @@ def expand_child_collection(
             ensure_dir(raw_dir_single)
 
     skip_substrings = parse_csv_env("HCP_SKIP_ERROR_SUBSTRINGS")
+    fast_forward_archived = os.getenv("HCP_ARCHIVED_JOB_FAST_FORWARD", "1") != "0"
 
     for it in parents:
         if id_field not in it:
@@ -601,14 +549,15 @@ def expand_child_collection(
             except requests.exceptions.HTTPError as e:
                 code = getattr(e.response, "status_code", None)
 
-                if listing_name == "jobs" and is_archived_parent_error(e):
-                    print(f"[WARN] {child_name}: encountered archived job at parent {parent_id} "
-                          f"(HTTP {code}). Fast-forwarding remaining parents and moving to next endpoint.")
+                # Fast-forward if we hit archived job and this child is under jobs
+                if fast_forward_archived and listing_name == "jobs" and is_archived_parent_error(e):
+                    print(f"[FAST-FWD] {child_name}: encountered archived job at parent {parent_id} (HTTP {code}); "
+                          f"skipping remaining parents for this child.")
                     if summary_tracker is not None:
                         summary_tracker.setdefault("fast_forwarded_due_to_archived", {}) \
                                        .setdefault(child_name, 0)
                         summary_tracker["fast_forwarded_due_to_archived"][child_name] += 1
-                    break
+                    break  # break the parent loop for this child endpoint
 
                 if is_not_found_error(e) or matches_skip_text(e, skip_substrings):
                     print(f"[WARN] Skipping {child_name} for parent {parent_id} due to {code} / matched skip policy")
@@ -626,7 +575,6 @@ def expand_child_collection(
             write_ndjson_line(nd_path, payload, container_key=container_key, allow_envelope=True)
 
         else:
-            # Collection child; optionally hydrate per item
             hydrate = child_def.get("hydrate")
             if not hydrate:
                 parent_suffix = f"{listing_name}_{parent_id}"
@@ -652,7 +600,6 @@ def expand_child_collection(
                         ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
                 continue
 
-            # Hydration mode: paginate ourselves to inspect rows and optionally fetch details
             nd_rows_path = outdir / f"{child_name}.ndjson"
             require_keys = hydrate.get("require_keys") or []
             detail_path_tmpl = hydrate["path"]
@@ -677,7 +624,6 @@ def expand_child_collection(
                         if not isinstance(item, dict):
                             continue
 
-                        # Optional filter: for checklist endpoints, only keep non-empty when switch is on
                         if checklists_non_empty_only and "checklists" in child_name:
                             obj_to_write = item
                             if needs_hydration(item, require_keys):
@@ -703,7 +649,6 @@ def expand_child_collection(
                                     }) + "\n")
                             continue
 
-                        # Default path: hydrate only if required keys are missing
                         if needs_hydration(item, require_keys):
                             cid = item.get(detail_id_field)
                             if cid:
@@ -771,7 +716,7 @@ def main() -> None:
         if not endpoints:
             sys.exit(f"--only '{args.only}' did not match any endpoint")
 
-    # Normalize page size on every endpoint (if not set explicitly)
+    # Normalize page size
     normalized: List[Dict[str, Any]] = []
     for ep in endpoints:
         ep = dict(ep)
@@ -781,23 +726,20 @@ def main() -> None:
         normalized.append(ep)
     endpoints = normalized
 
-    # Resume cutoff
     ordered_names = [ep["name"] for ep in endpoints]
     last_done_idx = compute_resume_cutoff(outdir, ordered_names) if args.resume else -1
     if args.resume and last_done_idx >= 0:
         print(f"[INFO] Resume enabled. Detected progress up to '{ordered_names[last_done_idx]}' (index {last_done_idx}).")
         print("[INFO] All endpoints at or before that index will be skipped.")
 
-    # Generic disables
     disabled_groups: set[str] = set() | parse_csv_env("HCP_DISABLE_GROUPS")
     disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")
-    default_404_groups = {"api/price_book"}  # extend if you want others to skip on 404 by default
+    default_404_groups = {"api/price_book"}
     disabled_404_groups = set() | parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
     os.environ["HCP_TREAT_404_AS_SKIP_GROUPS"] = ",".join(sorted(default_404_groups | disabled_404_groups))
     if disabled_endpoints:
         endpoints = [ep for ep in endpoints if ep.get("name") not in disabled_endpoints]
 
-    # Tracking for end-of-run summary
     summary = {
         "skipped_due_to_resume": [],
         "skipped_due_to_group": [],
@@ -820,7 +762,7 @@ def main() -> None:
             summary["skipped_due_to_resume"].append(name)
             continue
 
-        if should_skip_endpoint_due_to_group(ep, disabled_groups):
+        if endpoint_group(ep) in disabled_groups:
             print(f"[SKIP] {name} (group '{group}' disabled)")
             summary["skipped_due_to_group"].append({"name": name, "group": group})
             continue
@@ -871,7 +813,6 @@ def main() -> None:
             summary["processed_endpoints"].append(name)
             continue
 
-        # Regular top-level endpoint
         print(f"[INFO] Fetching {name} from {path}")
         try:
             paginate_collect(
@@ -891,7 +832,6 @@ def main() -> None:
             summary["skipped_due_to_404_policy"].append({"name": ne.endpoint_name, "group": ne.group})
             continue
 
-    # Write manifest
     manifest = {
         "base_url": base_url,
         "generated_at_utc": utcnow_iso(),
@@ -907,7 +847,6 @@ def main() -> None:
     }
     (outdir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # ------------ End-of-run concise summary (printed) ------------
     print("\n=== Run Summary ===")
     print(f"Output dir: {outdir}")
     print(f"Processed endpoints ({len(summary['processed_endpoints'])}): {', '.join(summary['processed_endpoints']) or '-'}")
