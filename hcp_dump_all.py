@@ -423,6 +423,37 @@ def is_archived_parent_error(exc: requests.exceptions.HTTPError) -> bool:
         return False
     txt = (resp.text or "").lower()
     return "archived job" in txt or ("archived" in txt and "job" in txt)
+def classify_single_child_fetch(
+    session_headers: Dict[str, str],
+    url: str,
+    params: Dict[str, Any],
+    *,
+    skip_substrings: Iterable[str],
+) -> Tuple[Optional[dict], str]:
+    """
+    Returns (payload, status):
+      - (payload, "ok") on success
+      - (None,   "archived") when HTTP 400/404 body mentions archived job
+      - (None,   "skip")     for 404 or configured skip-substring matches
+      - raises requests.exceptions.HTTPError for everything else
+    """
+    try:
+        payload, _ = robust_get(url, encode_params(params), session_headers)
+        return payload, "ok"
+    except requests.exceptions.HTTPError as e:
+        code = getattr(e.response, "status_code", None)
+        text = (getattr(e.response, "text", "") or "").lower()
+
+        # Specific: HCP archived job (400 or 404 + text indicates archived)
+        if code in (400, 404) and ("archived job" in text or ("archived" in text and "job" in text)):
+            return None, "archived"
+
+        # General: treat as a per-parent skip if matched text or it's a 404
+        if code == 404 or matches_skip_text(e, skip_substrings):
+            return None, "skip"
+
+        # Unknown error: bubble up for caller to handle at endpoint/group level
+        raise
 
 # ---------------- Pagination and expansion ----------------
 
@@ -512,12 +543,23 @@ def expand_child_collection(
     summary_tracker: Optional[Dict[str, Any]] = None,
     checklists_non_empty_only: bool = False,
 ) -> None:
+    """
+    Expand a child endpoint for each parent row.
+
+    Supports:
+      - single_object children (one GET per parent, writes whole payload)
+      - collection children (paginated), with optional per-row hydration
+      - archived-job fast-forward for jobs children (HTTP 400 'Archived job')
+      - optional filter to keep only non-empty checklists
+      - raw JSON mirroring
+    """
     id_field = child_def.get("id_field", "id")
     child_name = child_def["name"]
     container_key = child_def.get("container_key")
     single_object = child_def.get("single_object", False)
     group = endpoint_group(child_def)
 
+    # Prefer RAW parents if available; fallback to NDJSON
     parents = list(read_parent_items_from_raw(outdir, listing_name, parent_container_key))
     if not parents:
         parents = list(read_parent_items_from_ndjson(outdir, listing_name))
@@ -525,6 +567,7 @@ def expand_child_collection(
         print(f"[WARN] No parent items found for '{listing_name}', cannot expand '{child_name}'")
         return
 
+    # Output prep for single-object children
     nd_path: Optional[pathlib.Path] = None
     raw_dir_single: Optional[pathlib.Path] = None
     if single_object:
@@ -533,6 +576,7 @@ def expand_child_collection(
             raw_dir_single = outdir / "raw" / child_name
             ensure_dir(raw_dir_single)
 
+    # Policies
     skip_substrings = parse_csv_env("HCP_SKIP_ERROR_SUBSTRINGS")
     fast_forward_archived = os.getenv("HCP_ARCHIVED_JOB_FAST_FORWARD", "1") != "0"
 
@@ -542,113 +586,98 @@ def expand_child_collection(
         parent_id = it[id_field]
         call_params = substitute_params(child_def.get("params", {}), it)
         path = child_def["path"].replace("{id}", str(parent_id))
+        url = f"{base_url}{path}"
 
         if single_object:
-            try:
-                payload, _ = robust_get(f"{base_url}{path}", encode_params(call_params), session_headers)
-            except requests.exceptions.HTTPError as e:
-                code = getattr(e.response, "status_code", None)
+            # One GET per parent; never let HTTPError bubble out.
+            payload, status = classify_single_child_fetch(
+                session_headers, url, call_params, skip_substrings=skip_substrings
+            )
 
-                # Fast-forward if we hit archived job and this child is under jobs
-                if fast_forward_archived and listing_name == "jobs" and is_archived_parent_error(e):
-                    print(f"[FAST-FWD] {child_name}: encountered archived job at parent {parent_id} (HTTP {code}); "
-                          f"skipping remaining parents for this child.")
+            if status == "archived" and listing_name == "jobs":
+                if fast_forward_archived:
+                    print(f"[FAST-FWD] {child_name}: archived job at parent {parent_id}; skipping remaining parents for this child.")
                     if summary_tracker is not None:
-                        summary_tracker.setdefault("fast_forwarded_due_to_archived", {}) \
-                                       .setdefault(child_name, 0)
+                        summary_tracker.setdefault("fast_forwarded_due_to_archived", {}).setdefault(child_name, 0)
                         summary_tracker["fast_forwarded_due_to_archived"][child_name] += 1
-                    break  # break the parent loop for this child endpoint
-
-                if is_not_found_error(e) or matches_skip_text(e, skip_substrings):
-                    print(f"[WARN] Skipping {child_name} for parent {parent_id} due to {code} / matched skip policy")
+                    break  # stop this child entirely
+                else:
+                    print(f"[WARN] {child_name}: archived job for parent {parent_id}; skipping this parent.")
                     if summary_tracker is not None:
                         summary_tracker.setdefault("child_skips", {}).setdefault(child_name, 0)
                         summary_tracker["child_skips"][child_name] += 1
                     continue
 
-                raise
+            if status == "skip":
+                print(f"[WARN] Skipping {child_name} for parent {parent_id} (not found or matched skip policy).")
+                if summary_tracker is not None:
+                    summary_tracker.setdefault("child_skips", {}).setdefault(child_name, 0)
+                    summary_tracker["child_skips"][child_name] += 1
+                continue
 
+            # Success: write
             if raw_json and raw_dir_single:
                 (raw_dir_single / f"{parent_id}.json").write_text(
                     json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
                 )
             write_ndjson_line(nd_path, payload, container_key=container_key, allow_envelope=True)
+            continue
 
-        else:
-            hydrate = child_def.get("hydrate")
-            if not hydrate:
-                parent_suffix = f"{listing_name}_{parent_id}"
-                pages = paginate_collect(
-                    session_headers,
-                    base_url,
-                    path,
-                    call_params,
-                    page_size,
-                    container_key,
-                    outdir=outdir,
-                    name=child_name,
-                    resume=resume,
-                    delay_ms=delay_ms,
-                    max_pages=max_pages,
-                    raw_json=raw_json,
-                    parent_dir_suffix=parent_suffix,
-                    current_group=group,
-                )
-                if pages == 0:
+        # Collection child (paginated), possibly with hydration
+        hydrate = child_def.get("hydrate")
+        if not hydrate:
+            parent_suffix = f"{listing_name}_{parent_id}"
+            pages = paginate_collect(
+                session_headers,
+                base_url,
+                path,
+                call_params,
+                page_size,
+                container_key,
+                outdir=outdir,
+                name=child_name,
+                resume=resume,
+                delay_ms=delay_ms,
+                max_pages=max_pages,
+                raw_json=raw_json,
+                parent_dir_suffix=parent_suffix,
+                current_group=group,
+            )
+            if pages == 0:
+                empty_idx = outdir / f"{child_name}.empty.ndjson"
+                with empty_idx.open("a", encoding="utf-8") as ef:
+                    ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
+            continue
+
+        # Hydration mode — need to inspect items to decide if a detail fetch is required
+        nd_rows_path = outdir / f"{child_name}.ndjson"
+        require_keys = hydrate.get("require_keys") or []
+        detail_path_tmpl = hydrate["path"]
+        detail_id_field = hydrate.get("id_field", "id")
+
+        page = 1
+        while True:
+            params = dict(call_params)
+            params["page"] = page
+            params["page_size"] = page_size
+            payload, _ = robust_get(url, encode_params(params), session_headers)
+            items, _ck = extract_items(payload, container_key)
+
+            if not items:
+                if page == 1:
                     empty_idx = outdir / f"{child_name}.empty.ndjson"
                     with empty_idx.open("a", encoding="utf-8") as ef:
                         ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
-                continue
+                break
 
-            nd_rows_path = outdir / f"{child_name}.ndjson"
-            require_keys = hydrate.get("require_keys") or []
-            detail_path_tmpl = hydrate["path"]
-            detail_id_field = hydrate.get("id_field", "id")
+            with nd_rows_path.open("a", encoding="utf-8") as out_f:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
 
-            page = 1
-            while True:
-                params = dict(call_params)
-                params["page"] = page
-                params["page_size"] = page_size
-                payload, _ = robust_get(f"{base_url}{path}", encode_params(params), session_headers)
-                items, _ck = extract_items(payload, container_key)
-                if not items:
-                    if page == 1:
-                        empty_idx = outdir / f"{child_name}.empty.ndjson"
-                        with empty_idx.open("a", encoding="utf-8") as ef:
-                            ef.write(json.dumps({"parent": listing_name, "parent_id": parent_id}) + "\n")
-                    break
-
-                with nd_rows_path.open("a", encoding="utf-8") as out_f:
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-
-                        if checklists_non_empty_only and "checklists" in child_name:
-                            obj_to_write = item
-                            if needs_hydration(item, require_keys):
-                                cid = item.get(detail_id_field)
-                                if cid:
-                                    d_path = detail_path_tmpl.replace("{id}", str(cid))
-                                    try:
-                                        detail, _ = robust_get(f"{base_url}{d_path}", {}, session_headers)
-                                        if isinstance(detail, dict):
-                                            obj_to_write = detail
-                                    except requests.exceptions.HTTPError:
-                                        pass
-                            if checklist_has_content(obj_to_write):
-                                out_f.write(json.dumps(obj_to_write, ensure_ascii=False) + "\n")
-                            else:
-                                ei = outdir / f"{child_name}.empty.ndjson"
-                                with ei.open("a", encoding="utf-8") as ef:
-                                    ef.write(json.dumps({
-                                        "parent": listing_name,
-                                        "parent_id": parent_id,
-                                        "checklist_id": obj_to_write.get("id"),
-                                        "title": obj_to_write.get("title")
-                                    }) + "\n")
-                            continue
-
+                    # Optional checklist filter: keep only those with at least one item in any section
+                    if checklists_non_empty_only and "checklists" in child_name:
+                        obj_to_write = item
                         if needs_hydration(item, require_keys):
                             cid = item.get(detail_id_field)
                             if cid:
@@ -656,15 +685,44 @@ def expand_child_collection(
                                 try:
                                     detail, _ = robust_get(f"{base_url}{d_path}", {}, session_headers)
                                     if isinstance(detail, dict):
-                                        out_f.write(json.dumps(detail, ensure_ascii=False) + "\n")
-                                        continue
+                                        obj_to_write = detail
                                 except requests.exceptions.HTTPError:
                                     pass
-                        out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                        if checklist_has_content(obj_to_write):
+                            out_f.write(json.dumps(obj_to_write, ensure_ascii=False) + "\n")
+                        else:
+                            ei = outdir / f"{child_name}.empty.ndjson"
+                            with ei.open("a", encoding="utf-8") as ef:
+                                ef.write(json.dumps({
+                                    "parent": listing_name,
+                                    "parent_id": parent_id,
+                                    "checklist_id": obj_to_write.get("id"),
+                                    "title": obj_to_write.get("title")
+                                }) + "\n")
+                        continue
 
-                if len(items) < page_size:
-                    break
-                page += 1
+                    # Default: hydrate only when required keys are missing (missing, not empty)
+                    if needs_hydration(item, require_keys):
+                        cid = item.get(detail_id_field)
+                        if cid:
+                            d_path = detail_path_tmpl.replace("{id}", str(cid))
+                            try:
+                                detail, _ = robust_get(f"{base_url}{d_path}", {}, session_headers)
+                                if isinstance(detail, dict):
+                                    out_f.write(json.dumps(detail, ensure_ascii=False) + "\n")
+                                    continue
+                            except requests.exceptions.HTTPError:
+                                # If detail fails, fall back to writing the listing item
+                                pass
+                    out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+            if len(items) < page_size:
+                break
+            page += 1
+
+
+
+
 
 def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:
     if not isinstance(spec, list):
@@ -798,18 +856,23 @@ def main() -> None:
                     continue
 
             print(f"[INFO] Expanding child collection {name} via {parent_name}")
+            print(f"[DBG] single_object={ep.get('single_object', False)}, child={ep.get('name')}, url={ep.get('path')}")
             try:
                 expand_child_collection(
                     headers, base_url, parent_name, ep, args.page_size, outdir, args.resume, args.delay_ms,
                     args.max_pages, parent_container_key=parent_ck, raw_json=args.raw_json, summary_tracker=summary,
                     checklists_non_empty_only=args.checklists_non_empty_only
                 )
-            except AuthzError as ae:
-                print(f"[WARN] {ae.endpoint_name}: auth failure ({ae.status_code}). Disabling group '{ae.group}' for this run.")
-                disabled_groups.add(ae.group)
-                summary["auth_failures"].append((ae.endpoint_name, ae.group, ae.status_code))
-                summary["skipped_due_to_group"].append({"name": name, "group": ae.group})
-                continue
+            except requests.exceptions.HTTPError as e:
+                if parent_name == "jobs" and is_archived_parent_error(e):
+                    if os.getenv("HCP_ARCHIVED_JOB_FAST_FORWARD", "1") != "0":
+                        print(f"[FAST-FWD] {name}: encountered archived job during expansion; skipping remaining parents for this child.")
+                        summary.setdefault("fast_forwarded_due_to_archived", {}).setdefault(name, []).append(parent_name)
+                        summary["fast_forwarded_due_to_archived"][name] += 1
+                    else:
+                        print(f"[WARN] {name}: archived job at {parent_name}, skipping this parent.")
+                else:
+                    raise
             summary["processed_endpoints"].append(name)
             continue
 
