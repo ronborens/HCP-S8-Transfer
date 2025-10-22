@@ -388,6 +388,17 @@ def checklist_has_content(obj: dict) -> bool:
             return True
     return False
 
+def is_archived_parent_error(exc: requests.exceptions.HTTPError) -> bool:
+    """Detect common archived-parent responses (e.g., HCP 'Archived job')."""
+    resp = getattr(exc, "response", None)
+    if not resp:
+        return False
+    if resp.status_code not in (400, 404):
+        return False
+    txt = (resp.text or "")[:2000].lower()
+    # Be generous but specific enough to avoid false positives
+    return ("archived job" in txt) or ("archived" in txt and "job" in txt)
+
 # ---------------- Pagination and expansion ----------------
 
 def paginate_collect(
@@ -526,14 +537,27 @@ def expand_child_collection(
             try:
                 payload, _ = robust_get(f"{base_url}{path}", encode_params(call_params), session_headers)
             except requests.exceptions.HTTPError as e:
-                # Skip a single parent on 404 or configured substrings; propagate others
+                code = getattr(e.response, "status_code", None)
+
+                # Fast-forward for archived jobs if these parents are 'jobs'
+                if listing_name == "jobs" and is_archived_parent_error(e):
+                    print(f"[WARN] {child_name}: encountered archived job at parent {parent_id} "
+                          f"(HTTP {code}). Fast-forwarding remaining parents and moving to next endpoint.")
+                    if summary_tracker is not None:
+                        summary_tracker.setdefault("fast_forwarded_due_to_archived", {}) \
+                                       .setdefault(child_name, 0)
+                        summary_tracker["fast_forwarded_due_to_archived"][child_name] += 1
+                    break  # exit parent loop; continue with next endpoint
+
+                # Benign skip-once (404 or matched skip substrings)
                 if is_not_found_error(e) or matches_skip_text(e, skip_substrings):
-                    print(f"[WARN] Skipping {child_name} for parent {parent_id} due to "
-                          f"{getattr(e.response, 'status_code', None)} / matched skip text")
+                    print(f"[WARN] Skipping {child_name} for parent {parent_id} due to {code} / matched skip policy")
                     if summary_tracker is not None:
                         summary_tracker.setdefault("child_skips", {}).setdefault(child_name, 0)
                         summary_tracker["child_skips"][child_name] += 1
                     continue
+
+                # Anything else: bubble up
                 raise
 
             if raw_json and raw_dir_single:
@@ -712,7 +736,8 @@ def main() -> None:
     # Generic disables
     disabled_groups: set[str] = set() | parse_csv_env("HCP_DISABLE_GROUPS")
     disabled_endpoints = parse_csv_env("HCP_DISABLE_ENDPOINTS")
-    default_404_groups = {"api/price_book", "checklists"}
+    # Reasonable defaults for 404-skip groups; merge with env
+    default_404_groups = {"api/price_book"}
     disabled_404_groups = set() | parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
     os.environ["HCP_TREAT_404_AS_SKIP_GROUPS"] = ",".join(sorted(default_404_groups | disabled_404_groups))
     if disabled_endpoints:
@@ -726,6 +751,7 @@ def main() -> None:
         "child_skips": {},
         "auth_failures": [],
         "processed_endpoints": [],
+        "fast_forwarded_due_to_archived": {},
     }
 
     for idx, ep in enumerate(endpoints):
@@ -849,6 +875,9 @@ def main() -> None:
     if summary["child_skips"]:
         for child_name, cnt in summary["child_skips"].items():
             print(f"Single-object child skips for '{child_name}': {cnt}")
+    if summary["fast_forwarded_due_to_archived"]:
+        for child_name, cnt in summary["fast_forwarded_due_to_archived"].items():
+            print(f"Fast-forwarded '{child_name}' due to archived jobs: {cnt} time(s)")
     if manifest["disabled_groups"]:
         print(f"Disabled groups this run: {', '.join(manifest['disabled_groups'])}")
     if summary["auth_failures"]:
