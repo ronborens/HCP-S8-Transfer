@@ -415,14 +415,12 @@ def checklist_has_content(obj: dict) -> bool:
             return True
     return False
 
-def is_archived_parent_error(exc: requests.exceptions.HTTPError) -> bool:
-    resp = getattr(exc, "response", None)
-    if not resp:
+def is_archived_parent_error_text(code: Optional[int], text: str) -> bool:
+    if code not in (400, 404):
         return False
-    if resp.status_code not in (400, 404):
-        return False
-    txt = (resp.text or "").lower()
-    return "archived job" in txt or ("archived" in txt and "job" in txt)
+    t = (text or "").lower()
+    return "archived job" in t or ("archived" in t and "job" in t)
+
 def classify_single_child_fetch(
     session_headers: Dict[str, str],
     url: str,
@@ -442,17 +440,17 @@ def classify_single_child_fetch(
         return payload, "ok"
     except requests.exceptions.HTTPError as e:
         code = getattr(e.response, "status_code", None)
-        text = (getattr(e.response, "text", "") or "").lower()
+        text = getattr(e.response, "text", "") or ""
 
-        # Specific: HCP archived job (400 or 404 + text indicates archived)
-        if code in (400, 404) and ("archived job" in text or ("archived" in text and "job" in text)):
+        if is_archived_parent_error_text(code, text):
             return None, "archived"
 
-        # General: treat as a per-parent skip if matched text or it's a 404
-        if code == 404 or matches_skip_text(e, skip_substrings):
+        if code == 404:
             return None, "skip"
 
-        # Unknown error: bubble up for caller to handle at endpoint/group level
+        if matches_skip_text(e, skip_substrings):
+            return None, "skip"
+
         raise
 
 # ---------------- Pagination and expansion ----------------
@@ -712,17 +710,12 @@ def expand_child_collection(
                                     out_f.write(json.dumps(detail, ensure_ascii=False) + "\n")
                                     continue
                             except requests.exceptions.HTTPError:
-                                # If detail fails, fall back to writing the listing item
                                 pass
                     out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
             if len(items) < page_size:
                 break
             page += 1
-
-
-
-
 
 def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:
     if not isinstance(spec, list):
@@ -795,6 +788,7 @@ def main() -> None:
     default_404_groups = {"api/price_book"}
     disabled_404_groups = set() | parse_csv_env("HCP_TREAT_404_AS_SKIP_GROUPS")
     os.environ["HCP_TREAT_404_AS_SKIP_GROUPS"] = ",".join(sorted(default_404_groups | disabled_404_groups))
+
     if disabled_endpoints:
         endpoints = [ep for ep in endpoints if ep.get("name") not in disabled_endpoints]
 
@@ -864,13 +858,15 @@ def main() -> None:
                     checklists_non_empty_only=args.checklists_non_empty_only
                 )
             except requests.exceptions.HTTPError as e:
-                if parent_name == "jobs" and is_archived_parent_error(e):
+                code = getattr(e.response, "status_code", None)
+                text = getattr(e.response, "text", "") or ""
+                if parent_name == "jobs" and is_archived_parent_error_text(code, text):
                     if os.getenv("HCP_ARCHIVED_JOB_FAST_FORWARD", "1") != "0":
                         print(f"[FAST-FWD] {name}: encountered archived job during expansion; skipping remaining parents for this child.")
-                        summary.setdefault("fast_forwarded_due_to_archived", {}).setdefault(name, []).append(parent_name)
+                        summary.setdefault("fast_forwarded_due_to_archived", {}).setdefault(name, 0)
                         summary["fast_forwarded_due_to_archived"][name] += 1
                     else:
-                        print(f"[WARN] {name}: archived job at {parent_name}, skipping this parent.")
+                        print(f"[WARN] {name}: archived job during expansion; skipping this parent and continuing.")
                 else:
                     raise
             summary["processed_endpoints"].append(name)
