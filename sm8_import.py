@@ -636,7 +636,7 @@ def import_employees(run_dir: pathlib.Path, headers: Dict[str, str], *, dry_run:
         processed += 1
         if processed <= max(skip, 0):
             continue
-        if limit is not None and created >= max(limit, 0):
+        if limit is not None and (processed - max(skip, 0)) > max(limit, 0):
             break
 
         first = (hcp.get("first_name") or "").strip()[:30]
@@ -720,7 +720,7 @@ def import_customers(run_dir: pathlib.Path, headers: Dict[str, str], *, dry_run:
         processed += 1
         if processed <= max(skip, 0):
             continue
-        if limit is not None and (created_clients + created_sites + created_contacts) >= max(limit, 0):
+        if limit is not None and (processed - max(skip, 0)) >= max(limit, 0):
             break
 
         comp = (hcp.get("company") or "").strip()
