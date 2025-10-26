@@ -3,23 +3,21 @@
 ServiceM8 Import Script — Imports data from Housecall Pro NDJSON exports to ServiceM8.
 
 Usage examples:
-  # Import newest run under ./hcp_export, employees only, dry-run
-  python sm8_import.py --latest --only employees --dry-run
+  # Import newest run under ./hcp_export, customers only, dry-run first
+  python sm8_import.py --latest --only customers --dry-run
 
-  # Import specific run dir
-  python sm8_import.py --ndjson-dir ./hcp_export/20251006T000000Z --only employees
-
-  # Be explicit about .env path and log level
-  python sm8_import.py --latest --dotenv ./.env --log-level DEBUG
+  # Then do the real run (employees + customers)
+  python sm8_import.py --latest --only employees
+  python sm8_import.py --latest --only customers
 
 Auth:
-  - OAuth bearer: set SM8_OAUTH_TOKEN (has scopes like manage_staff)
-  - API key: set SM8_API_KEY (your smk-... value); sent via X-Api-Key header
+  - OAuth bearer: set SM8_OAUTH_TOKEN (scopes like manage_staff, manage_customers, manage_customer_contacts)
+  - API key: set SM8_API_KEY (your smk-... value). We send it as X-Api-Key.
   - You can force mode with --auth-mode oauth|apikey (otherwise auto-detect)
 
 Notes:
-  - This file is generic: the import pipeline is reusable for other entities.
-  - Employees import is wired up as an example (HCP employees.ndjson -> SM8 /staff.json).
+  - “Clients” in ServiceM8 live at /company.json (also used for Company Sites via parent_company_uuid)
+  - “Company Contacts” live at /companycontact.json
 """
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ import random
 import re
 import sys
 import time
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import requests
 from requests import Session
@@ -46,72 +44,56 @@ from requests.exceptions import (
 from urllib3.exceptions import ProtocolError
 from dotenv import load_dotenv, find_dotenv
 
-# -------- Config / Globals --------
+# -------- Config --------
 
 SM8_BASE_URL = "https://api.servicem8.com/api_1.0"
 TIMESTAMP_DIR_RE = re.compile(r"^\d{8}T\d{6}Z$")
 
 TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
-TRANSIENT_EXC = (
-    ReadTimeout,
-    ConnectTimeout,
-    ReqConnectionError,
-    ChunkedEncodingError,
-    ProtocolError,
-)
+TRANSIENT_EXC = (ReadTimeout, ConnectTimeout, ReqConnectionError,
+                 ChunkedEncodingError, ProtocolError)
 
 DEFAULT_CONNECT_TIMEOUT = float(os.getenv("SM8_CONNECT_TIMEOUT", "15"))
 DEFAULT_READ_TIMEOUT = float(os.getenv("SM8_READ_TIMEOUT", "90"))
 DEFAULT_MAX_RETRIES = int(os.getenv("SM8_MAX_RETRIES", "8"))
 DEFAULT_BACKOFF_CAP = float(os.getenv("SM8_BACKOFF_MAX", "60"))
 
-logger = logging.getLogger("sm8-import")
+# -------- Logging --------
 
-# -------- Logging Setup --------
-
-
-def setup_logging(level: str) -> None:
-    lvl = getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=lvl,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    # requests/urllib3 can be noisy on DEBUG, keep them a notch lower
-    logging.getLogger("urllib3").setLevel(max(lvl, logging.WARNING))
-    logging.getLogger("requests").setLevel(max(lvl, logging.WARNING))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("sm8-import")
 
 # -------- Env / Auth --------
 
 
 def load_env(dotenv_path: Optional[str]) -> Optional[str]:
-    """Load .env (explicit path or auto-discovered) and return the path used (if any)."""
+    """Load .env (explicit path or auto-discovered) and return path used (if any)."""
     used_path = None
     if dotenv_path:
         env_file = str(pathlib.Path(dotenv_path).resolve())
-        loaded = load_dotenv(env_file, override=False)
-        used_path = env_file if loaded else None
+        if load_dotenv(env_file, override=False):
+            used_path = env_file
     else:
-        used_path = find_dotenv(usecwd=True)
-        if used_path:
-            load_dotenv(used_path, override=False)
+        found = find_dotenv(usecwd=True)
+        if found:
+            load_dotenv(found, override=False)
+            used_path = found
+    if used_path:
+        log.info("Loaded env from: %s", used_path)
     return used_path
 
 
-def build_auth_headers_and_method(auth_mode: Optional[str]) -> Tuple[Dict[str, str], Optional[Tuple[str, str]], str]:
+def build_auth(headers: Dict[str, str], auth_mode: Optional[str]) -> Tuple[Dict[str, str], Optional[Tuple[str, str]], str]:
     """
-    Return (headers, basic_auth_tuple_or_None, mode_str).
+    Returns (headers, basic_auth_tuple_or_None, mode_str).
 
     Modes:
-      - "oauth": Authorization: Bearer <SM8_OAUTH_TOKEN>
-      - "apikey": X-Api-Key: <SM8_API_KEY>   (NOTE: header; no HTTP Basic)
+      - oauth  -> headers['Authorization'] = 'Bearer <SM8_OAUTH_TOKEN>'
+      - apikey -> headers['X-Api-Key'] = <SM8_API_KEY>
     """
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "sm8-import/1.0",
-    }
-
     forced = (auth_mode or "").strip().lower()
     oauth_token = os.getenv("SM8_OAUTH_TOKEN")
     api_key = os.getenv("SM8_API_KEY")
@@ -120,28 +102,27 @@ def build_auth_headers_and_method(auth_mode: Optional[str]) -> Tuple[Dict[str, s
         if not oauth_token:
             sys.exit("Auth mode forced to 'oauth' but SM8_OAUTH_TOKEN is missing.")
         headers["Authorization"] = f"Bearer {oauth_token}"
-        logger.info("Auth mode: oauth (Bearer token)")
+        log.info("Auth mode: oauth (Bearer token)")
         return headers, None, "oauth"
 
     if forced == "apikey":
         if not api_key:
             sys.exit("Auth mode forced to 'apikey' but SM8_API_KEY is missing.")
         headers["X-Api-Key"] = api_key
-        logger.info("Auth mode: apikey (X-Api-Key header)")
+        log.info("Auth mode: apikey (X-Api-Key)")
         return headers, None, "apikey"
 
-    # Auto-detect: prefer OAuth if supplied, else fall back to API key
+    # Auto-detect
     if oauth_token:
         headers["Authorization"] = f"Bearer {oauth_token}"
-        logger.info("Auth mode: oauth (Bearer token) [auto]")
+        log.info("Auth mode: oauth (Bearer token) [auto]")
         return headers, None, "oauth"
-
     if api_key:
         headers["X-Api-Key"] = api_key
-        logger.info("Auth mode: apikey (X-Api-Key header) [auto]")
+        log.info("Auth mode: apikey (X-Api-Key) [auto]")
         return headers, None, "apikey"
 
-    sys.exit("Missing ServiceM8 credentials. Provide either SM8_OAUTH_TOKEN (oauth) or SM8_API_KEY (apikey).")
+    sys.exit("Missing ServiceM8 credentials. Provide SM8_OAUTH_TOKEN or SM8_API_KEY.")
 
 # -------- Path resolution --------
 
@@ -169,7 +150,7 @@ def resolve_ndjson_dir(base_or_run: Optional[str], latest: bool) -> pathlib.Path
         runs = list_timestamp_dirs(base)
         if not runs:
             sys.exit(f"No timestamped runs found under: {base}")
-        logger.info("Using newest run: %s", runs[0])
+        log.info("Using newest run: %s", runs[0])
         return runs[0]
     if not base_or_run:
         sys.exit("You must pass --ndjson-dir or --latest")
@@ -186,7 +167,7 @@ def get_session() -> Session:
     if _session is None:
         s = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10, pool_maxsize=20, max_retries=0)
+            pool_connections=20, pool_maxsize=40, max_retries=0)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
         _session = s
@@ -199,11 +180,11 @@ def sm8_request(
     headers: Dict[str, str],
     *,
     json_body: Optional[Dict[str, Any]] = None,
-    basic_auth: Optional[Tuple[str, str]] = None,
     retries: int = DEFAULT_MAX_RETRIES,
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
     read_timeout: float = DEFAULT_READ_TIMEOUT,
     backoff_cap: float = DEFAULT_BACKOFF_CAP,
+    params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], requests.Response]:
     """
     Generic request wrapper for ServiceM8 API with retries on 429/5xx + network hiccups.
@@ -225,17 +206,15 @@ def sm8_request(
                 method=method.upper(),
                 url=url,
                 json=json_body,
+                params=params,
                 headers=headers,
-                auth=basic_auth,  # None in apikey & oauth modes
                 timeout=(connect_timeout, read_timeout),
             )
         except TRANSIENT_EXC as e:
             sleep_for = min(backoff + random.uniform(0,
                             backoff * 0.25), backoff_cap)
-            logger.warning(
-                "Network error on %s %s (%s). Attempt %d/%d. Sleeping %.1fs.",
-                method.upper(), resource, type(e).__name__, attempt, retries, sleep_for
-            )
+            log.warning("Network error on %s %s (%s). Attempt %d/%d. Sleeping %.1fs.",
+                        method.upper(), resource, type(e).__name__, attempt, retries, sleep_for)
             time.sleep(sleep_for)
             backoff = min(backoff * 2, backoff_cap)
             continue
@@ -248,18 +227,16 @@ def sm8_request(
             else:
                 sleep_for = min(backoff + random.uniform(0,
                                 backoff * 0.25), backoff_cap)
-            logger.warning(
-                "Transient HTTP %s on %s %s. Attempt %d/%d. Sleeping %.1fs.",
-                r.status_code, method.upper(), resource, attempt, retries, sleep_for
-            )
+            log.warning("Transient HTTP %s on %s %s. Attempt %d/%d. Sleeping %.1fs.",
+                        r.status_code, method.upper(), resource, attempt, retries, sleep_for)
             time.sleep(sleep_for)
             backoff = min(backoff * 2, backoff_cap)
             continue
 
         if r.status_code >= 400:
             snippet = (r.text or "")[:500]
-            logger.error("%s %s -> HTTP %s :: %s", method.upper(),
-                         resource, r.status_code, snippet)
+            log.error("%s %s -> HTTP %s :: %s", method.upper(),
+                      resource, r.status_code, snippet)
             r.raise_for_status()
 
         try:
@@ -269,10 +246,8 @@ def sm8_request(
 
     if last_resp is not None:
         snippet = (last_resp.text or "")[:500]
-        logger.error(
-            "Exhausted retries. Last HTTP %s for %s %s :: %s",
-            last_resp.status_code, method.upper(), resource, snippet
-        )
+        log.error("Exhausted retries. Last HTTP %s for %s %s :: %s",
+                  last_resp.status_code, method.upper(), resource, snippet)
         last_resp.raise_for_status()
 
     raise RuntimeError(
@@ -294,285 +269,542 @@ def iter_ndjson(path: pathlib.Path) -> Iterable[Dict[str, Any]]:
             if isinstance(obj, dict):
                 yield obj
 
-# -------- Mapping helpers (HCP -> SM8) --------
+# -------- Canonicalization / keys --------
 
 
-def _coalesce(*vals) -> str:
-    for v in vals:
-        if v:
-            return str(v)
-    return ""
+def norm_email(s: Optional[str]) -> str:
+    s = (s or "").strip().lower()
+    return s
 
 
-def _name_fallback(hcp: Dict[str, Any]) -> Tuple[str, str]:
-    first = (hcp.get("first_name") or "").strip()
-    last = (hcp.get("last_name") or "").strip()
-    if first or last:
-        return first, last
-    name = (hcp.get("name") or "").strip()
-    if name:
-        parts = name.split()
-        if len(parts) >= 2:
-            return parts[0], " ".join(parts[1:])
-        return name, ""
-    email = (hcp.get("email") or "").strip()
-    if email and "@" in email:
-        return email.split("@", 1)[0], ""
-    return "Unknown", "Staff"
+def norm_phone(s: Optional[str]) -> str:
+    s = (s or "")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    # Normalize US 10/11 digits; leave others as-is
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits
 
 
-def map_hcp_employee_to_sm8_staff(hcp_employee: Dict[str, Any], *, default_role_uuid: Optional[str] = None) -> Dict[str, Any]:
-    """Field mapping: HCP employee -> ServiceM8 staff body."""
-    first, last = _name_fallback(hcp_employee)
-    email = (hcp_employee.get("email") or "").strip()
+def norm_name(s: Optional[str]) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    staff: Dict[str, Any] = {
-        "first": first[:30],
-        "last": last[:30],
-        "email": email,
+
+def addr_key(street: str, city: str, state: str, postcode: str) -> str:
+    def n(v: str) -> str:
+        v = (v or "").strip().lower()
+        v = re.sub(r"\s+", " ", v)
+        return v
+    return "|".join([n(street), n(city), n(state), n(postcode)])
+
+# -------- Preload (dedupe caches) --------
+
+
+def _extract_client_name(item: Dict[str, Any]) -> str:
+    return item.get("name") or item.get("company_name") or item.get("company") or ""
+
+
+def preload_clients(headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Load existing Clients (and Sites) to dedupe:
+      - name_index: name -> uuid
+      - email_index: email -> uuid
+      - phone_index: phone/mobile -> uuid
+      - site_index: (parent_uuid, address_key) -> uuid
+    """
+    name_idx: Dict[str, str] = {}
+    email_idx: Dict[str, str] = {}
+    phone_idx: Dict[str, str] = {}
+    site_idx: Dict[Tuple[str, str], str] = {}
+
+    page = 1
+    page_size = 500
+    total_loaded = 0
+    log.info("Preloading existing Clients from /company.json ...")
+    while True:
+        try:
+            data, _ = sm8_request(
+                "GET", "/company.json", headers, params={"page": page, "page_size": page_size})
+        except requests.HTTPError as e:
+            log.warning("Failed to list /company.json: HTTP %s :: %s",
+                        getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+            break
+
+        rows = data if isinstance(data, list) else []
+        if not rows:
+            break
+
+        for it in rows:
+            uuid = it.get("uuid") or it.get("id")
+            if not uuid:
+                continue
+            nm = norm_name(_extract_client_name(it))
+            em = norm_email(it.get("email"))
+            ph = norm_phone(it.get("phone") or it.get("mobile"))
+
+            if nm and nm not in name_idx:
+                name_idx[nm] = uuid
+            if em and em not in email_idx:
+                email_idx[em] = uuid
+            if ph and ph not in phone_idx:
+                phone_idx[ph] = uuid
+
+            parent_uuid = it.get("parent_company_uuid") or it.get(
+                "parent_uuid") or ""
+            if parent_uuid:
+                street = it.get("address_street") or it.get("street") or ""
+                city = it.get("address_city") or it.get("city") or ""
+                state = it.get("address_state") or it.get("state") or ""
+                postcode = it.get("address_postcode") or it.get(
+                    "postcode") or it.get("post_code") or ""
+                k = addr_key(street, city, state, postcode)
+                if k:
+                    site_idx[(parent_uuid, k)] = uuid
+
+        total_loaded += len(rows)
+        if len(rows) < page_size:
+            break
+        page += 1
+
+    log.info("Preloaded %d Clients/Sites; name:%d email:%d phone:%d sites:%d",
+             total_loaded, len(name_idx), len(email_idx), len(phone_idx), len(site_idx))
+    return {
+        "name_index": name_idx,
+        "email_index": email_idx,
+        "phone_index": phone_idx,
+        "site_index": site_idx,
     }
 
-    mobile = _coalesce(hcp_employee.get("mobile_number"),
-                       hcp_employee.get("phone"))
-    if mobile:
-        staff["mobile"] = mobile
 
-    job_title = hcp_employee.get("role") or hcp_employee.get("title")
-    if job_title:
-        staff["job_title"] = str(job_title)
-
-    color = (hcp_employee.get("color_hex") or "").strip()
-    if color:
-        if not color.startswith("#"):
-            color = f"#{color}"
-        staff["color"] = color
-
-    perms = hcp_employee.get("permissions") or {}
-    if isinstance(perms, dict):
-        staff["hide_from_schedule"] = 0 if perms.get(
-            "can_see_full_schedule") else 1
-
-    role_uuid = os.getenv("SM8_DEFAULT_ROLE_UUID", "") or (
-        default_role_uuid or "")
-    if role_uuid:
-        staff["security_role_uuid"] = role_uuid
-
-    return staff
-
-# -------- Generic preload + import pipeline --------
-
-
-def preload_existing_map(
-    resource: str,
-    headers: Dict[str, str],
-    *,
-    basic_auth: Optional[Tuple[str, str]],
-    key_selector: Callable[[Dict[str, Any]], Optional[str]],
-) -> Dict[str, str]:
+def preload_company_contacts(headers: Dict[str, str]) -> Dict[str, str]:
     """
-    Build a map: key -> uuid for existing records.
-
-    key_selector should return a stable, unique key used by your importer
-    (e.g., for staff: email.lower()).
+    Load existing Company Contacts to dedupe by name/email/phone.
+    Returns dict of key -> uuid where key is one of:
+      - "name:<norm_name>"
+      - "email:<norm_email>"
+      - "phone:<norm_phone>"
     """
-    logger.info("Preloading existing records from %s ...", resource)
-    try:
-        data, _ = sm8_request("GET", resource, headers, basic_auth=basic_auth)
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", None)
-        logger.warning("Failed to list %s: HTTP %s :: %s", resource,
-                       code, (getattr(e.response, "text", "") or "")[:200])
-        return {}
+    idx: Dict[str, str] = {}
+    page = 1
+    page_size = 500
+    total = 0
+    log.info("Preloading existing Company Contacts from /companycontact.json ...")
+    while True:
+        try:
+            data, _ = sm8_request("GET", "/companycontact.json",
+                                  headers, params={"page": page, "page_size": page_size})
+        except requests.HTTPError as e:
+            log.warning("Failed to list /companycontact.json: HTTP %s :: %s",
+                        getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+            break
 
-    if not isinstance(data, list):
-        logger.info(
-            "Preloaded 0 existing records from %s (non-list response).", resource)
-        return {}
+        rows = data if isinstance(data, list) else []
+        if not rows:
+            break
 
-    out: Dict[str, str] = {}
-    for row in data:
-        if not isinstance(row, dict):
-            continue
-        k = key_selector(row)
-        u = row.get("uuid")
-        if k and isinstance(u, str) and u:
-            out[k] = u
+        for it in rows:
+            uuid = it.get("uuid") or it.get("id")
+            if not uuid:
+                continue
+            first = it.get("first") or it.get("firstname") or ""
+            last = it.get("last") or it.get("lastname") or ""
+            nm = norm_name(f"{first} {last}".strip())
+            em = norm_email(it.get("email"))
+            ph = norm_phone(it.get("phone") or it.get("mobile"))
 
-    logger.info("Preloaded %d existing records from %s", len(out), resource)
-    return out
+            if nm:
+                idx.setdefault(f"name:{nm}", uuid)
+            if em:
+                idx.setdefault(f"email:{em}", uuid)
+            if ph:
+                idx.setdefault(f"phone:{ph}", uuid)
+
+        total += len(rows)
+        if len(rows) < page_size:
+            break
+        page += 1
+
+    log.info("Preloaded %d Company Contacts; index keys=%d", total, len(idx))
+    return idx
+
+# -------- Mapping: HCP -> SM8 --------
 
 
-def import_entities_generic(
-    *,
-    entity_name: str,
-    run_dir: pathlib.Path,
-    source_filename: str,
-    target_resource: str,
-    headers: Dict[str, str],
-    basic_auth: Optional[Tuple[str, str]],
-    map_func: Callable[[Dict[str, Any]], Dict[str, Any]],
-    src_key_selector: Callable[[Dict[str, Any]], Optional[str]],
-    existing_key_selector: Callable[[Dict[str, Any]], Optional[str]],
-    on_duplicate: str = "skip",  # skip|update|ignore
-    dry_run: bool = False,
-    limit: Optional[int] = None,
-    skip: int = 0,
-    mapping_out: Optional[pathlib.Path] = None,
-    preload: bool = True,
-) -> None:
+def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
     """
-    Generic importer:
-
-      - Reads NDJSON rows from run_dir/source_filename
-      - Preloads existing SM8 records (if preload=True) to avoid duplicates
-      - For each source row:
-          - map_func -> body
-          - derive key via src_key_selector (e.g., email)
-          - if key exists in preload map:
-              - skip | update (POST with uuid) | ignore (attempt create anyway)
-          - else create (POST)
-      - Writes mapping file if requested (source_key -> created/updated uuid)
+    Prefer a 'service' address; fall back to 'billing' if needed.
+    Returns dict with street, city, state, zip, country (strings, may be empty).
     """
-    src = run_dir / source_filename
+    addrs = hcp_customer.get("addresses") or []
+    service = next((a for a in addrs if (
+        a.get("type") or "").lower() == "service"), None)
+    billing = next((a for a in addrs if (
+        a.get("type") or "").lower() == "billing"), None)
+    a = service or billing or {}
+    return {
+        "street": a.get("street") or a.get("street_line_1") or "",
+        "city": a.get("city") or "",
+        "state": a.get("state") or "",
+        "zip": a.get("zip") or a.get("postcode") or "",
+        "country": a.get("country") or "",
+    }
+
+
+def map_hcp_to_sm8_company_object(name: str, email: str, phone: str, mobile: str, address: Dict[str, str], *, is_individual: bool, parent_company_uuid: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Build the SM8 Client payload (/company.json). When parent_company_uuid is provided, this creates a Site.
+    """
+    obj: Dict[str, Any] = {
+        "name": name,
+        "email": email or None,
+        "phone": phone or None,
+        "mobile": mobile or None,
+        # Primary address
+        "address_street": address.get("street") or None,
+        "address_city": address.get("city") or None,
+        "address_state": address.get("state") or None,
+        "address_postcode": address.get("zip") or None,
+        "address_country": address.get("country") or None,
+        # Individual/business flag (SM8 booleans are often "0"/"1" strings; SM8 accepts ints too)
+        "is_individual": 1 if is_individual else 0,
+    }
+    if parent_company_uuid:
+        obj["parent_company_uuid"] = parent_company_uuid
+    # Remove empty None's to keep payload lean
+    return {k: v for k, v in obj.items() if v not in (None, "", [])}
+
+
+def map_hcp_to_sm8_company_contact(company_uuid: str, hcp_customer: Dict[str, Any]) -> Dict[str, Any]:
+    first = (hcp_customer.get("first_name") or "").strip()
+    last = (hcp_customer.get("last_name") or "").strip()
+    email = (hcp_customer.get("email") or "").strip()
+    phone = hcp_customer.get(
+        "home_number") or hcp_customer.get("work_number") or ""
+    mobile = hcp_customer.get("mobile_number") or ""
+    return {
+        "company_uuid": company_uuid,
+        "first": first or None,
+        "last": last or None,
+        "email": email or None,
+        "phone": phone or None,
+        "mobile": mobile or None,
+    }
+
+# -------- Upsert helpers --------
+
+
+def upsert_client(headers: Dict[str, str], caches: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    """
+    Dedupe by name OR email OR phone using preloaded caches.
+    If exists: return uuid; else create and return new uuid.
+    """
+    name_idx = caches["name_index"]
+    email_idx = caches["email_index"]
+    phone_idx = caches["phone_index"]
+
+    nm = norm_name(payload.get("name"))
+    em = norm_email(payload.get("email"))
+    ph = norm_phone(payload.get("phone") or payload.get("mobile"))
+
+    candidate = name_idx.get(nm) or (email_idx.get(em) if em else None) or (
+        phone_idx.get(ph) if ph else None)
+    if candidate:
+        return candidate
+
+    data, resp = sm8_request("POST", "/company.json",
+                             headers, json_body=payload)
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    if not uuid:
+        raise RuntimeError("Client created but no uuid returned")
+
+    # Update caches so later rows dedupe correctly within run
+    if nm and nm not in name_idx:
+        name_idx[nm] = uuid
+    if em and em not in email_idx:
+        email_idx[em] = uuid
+    if ph and ph not in phone_idx:
+        phone_idx[ph] = uuid
+
+    log.info("[OK] Client upsert: %s -> %s", payload.get("name"), uuid)
+    return uuid
+
+
+def upsert_site(headers: Dict[str, str], caches: Dict[str, Any], parent_uuid: str, payload: Dict[str, Any]) -> str:
+    """
+    Dedupe site by (parent_uuid, address_key).
+    """
+    site_idx = caches["site_index"]
+
+    k = addr_key(payload.get("address_street", ""), payload.get("address_city", ""),
+                 payload.get("address_state", ""), payload.get("address_postcode", ""))
+    if not k:
+        # No address -> creating a site doesn’t make sense; fall back to parent
+        return parent_uuid
+
+    existing = site_idx.get((parent_uuid, k))
+    if existing:
+        return existing
+
+    data, resp = sm8_request("POST", "/company.json",
+                             headers, json_body=payload)
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    if not uuid:
+        raise RuntimeError("Site created but no uuid returned")
+
+    site_idx[(parent_uuid, k)] = uuid
+    log.info("[OK] Site upsert for parent=%s at %s -> %s",
+             parent_uuid, k, uuid)
+    return uuid
+
+
+def upsert_company_contact(headers: Dict[str, str], contact_idx: Dict[str, str], payload: Dict[str, Any]) -> Optional[str]:
+    """
+    Dedupe contact by name OR email OR phone.
+    """
+    first = payload.get("first") or ""
+    last = payload.get("last") or ""
+    email = payload.get("email") or ""
+    phone = payload.get("phone") or ""
+    mobile = payload.get("mobile") or ""
+
+    nm = norm_name(f"{first} {last}".strip())
+    em = norm_email(email)
+    ph = norm_phone(phone or mobile)
+
+    key = None
+    for cand in [f"name:{nm}" if nm else None, f"email:{em}" if em else None, f"phone:{ph}" if ph else None]:
+        if cand and cand in contact_idx:
+            return contact_idx[cand]
+
+    data, resp = sm8_request("POST", "/companycontact.json", headers,
+                             json_body={k: v for k, v in payload.items() if v not in ("", None)})
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    if not uuid:
+        return None
+
+    if nm:
+        contact_idx.setdefault(f"name:{nm}", uuid)
+    if em:
+        contact_idx.setdefault(f"email:{em}", uuid)
+    if ph:
+        contact_idx.setdefault(f"phone:{ph}", uuid)
+
+    log.info("[OK] Company Contact upsert: %s %s -> %s", first, last, uuid)
+    return uuid
+
+# -------- Importers --------
+
+
+def import_employees(run_dir: pathlib.Path, headers: Dict[str, str], *, dry_run: bool, limit: Optional[int], skip: int, default_role_uuid: Optional[str]) -> None:
+    src = run_dir / "employees.ndjson"
     if not src.exists():
-        logger.warning("%s not found in %s; nothing to import.",
-                       source_filename, run_dir)
+        log.warning(
+            "employees.ndjson not found in %s; nothing to import.", run_dir)
         return
 
-    logger.info("Importing %s from %s", entity_name, src)
-
-    existing_map: Dict[str, str] = {}
-    if preload:
-        existing_map = preload_existing_map(
-            target_resource,
-            headers,
-            basic_auth=basic_auth,
-            key_selector=existing_key_selector,
-        )
-
+    log.info("Importing employees from %s", src)
     created = 0
-    updated = 0
     processed = 0
-    written_map: Dict[str, str] = {}
 
-    for row in iter_ndjson(src):
+    # Preload existing staff to avoid dup emails (best-effort)
+    # If this 401s due to scope, we'll still try to create; SM8 will error on duplicate email anyway.
+    existing_emails = set()
+    try:
+        page, page_size = 1, 500
+        log.info("Preloading existing Staff from /staff.json ...")
+        while True:
+            data, _ = sm8_request(
+                "GET", "/staff.json", headers, params={"page": page, "page_size": page_size})
+            rows = data if isinstance(data, list) else []
+            if not rows:
+                break
+            for it in rows:
+                em = norm_email(it.get("email"))
+                if em:
+                    existing_emails.add(em)
+            if len(rows) < page_size:
+                break
+            page += 1
+        log.info("Preloaded %d staff emails", len(existing_emails))
+    except requests.HTTPError as e:
+        log.warning("Failed to list /staff.json: HTTP %s :: %s",
+                    getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+
+    for hcp in iter_ndjson(src):
         processed += 1
         if processed <= max(skip, 0):
             continue
-        if limit is not None and (created + updated) >= max(limit, 0):
+        if limit is not None and created >= max(limit, 0):
             break
 
-        src_key = src_key_selector(row)
-        if not src_key:
-            logger.warning("[SKIP] %s row missing selectable key", entity_name)
-            continue
+        first = (hcp.get("first_name") or "").strip()[:30]
+        last = (hcp.get("last_name") or "").strip()[:30]
+        email = norm_email(hcp.get("email"))
+        mobile = hcp.get("mobile_number") or hcp.get("phone") or ""
+        job_title = hcp.get("role") or hcp.get("title") or ""
+        color = hcp.get("color_hex") or ""
+        if color and not color.startswith("#"):
+            color = "#" + color
 
-        body = map_func(row)
-        missing = [k for k in ("first", "last", "email")
-                   if target_resource == "/staff.json" and not body.get(k)]
-        if missing:
-            logger.warning("[SKIP] %s key=%s missing required fields: %s",
-                           entity_name, src_key, ", ".join(missing))
-            continue
+        staff = {
+            "first": first or "Unknown",
+            "last": last or "Staff",
+            "email": email or f"noemail+{processed}@example.invalid",
+        }
+        if mobile:
+            staff["mobile"] = mobile
+        if job_title:
+            staff["job_title"] = str(job_title)
+        if color:
+            staff["color"] = color
+        role_uuid = os.getenv("SM8_DEFAULT_ROLE_UUID") or default_role_uuid
+        if role_uuid:
+            staff["security_role_uuid"] = role_uuid
 
-        existing_uuid = existing_map.get(src_key)
-
-        # Duplicate policy
-        if existing_uuid:
-            if dry_run:
-                if on_duplicate == "update":
-                    logger.info("[DRY] Would UPDATE %s key=%s uuid=%s body=%s", entity_name,
-                                src_key, existing_uuid, json.dumps(body, ensure_ascii=False))
-                else:
-                    logger.info("[DRY] Would SKIP existing %s key=%s uuid=%s",
-                                entity_name, src_key, existing_uuid)
-                written_map[src_key] = existing_uuid
-                if on_duplicate == "update":
-                    updated += 1
-                continue
-
-            if on_duplicate == "skip":
-                logger.info("[SKIP] Existing %s key=%s uuid=%s",
-                            entity_name, src_key, existing_uuid)
-                written_map[src_key] = existing_uuid
-                continue
-
-            if on_duplicate == "update":
-                # ServiceM8 updates can be done by POSTing with "uuid" supplied.
-                update_body = dict(body)
-                update_body["uuid"] = existing_uuid
-                try:
-                    _, resp = sm8_request(
-                        "POST", target_resource, headers, json_body=update_body, basic_auth=basic_auth)
-                    logger.info("[OK] Updated %s key=%s uuid=%s",
-                                entity_name, src_key, existing_uuid)
-                    written_map[src_key] = existing_uuid
-                    updated += 1
-                except requests.HTTPError as e:
-                    code = getattr(e.response, "status_code", None)
-                    snippet = (getattr(e.response, "text", "") or "")[:300]
-                    logger.error("Failed to UPDATE %s key=%s uuid=%s: HTTP %s :: %s",
-                                 entity_name, src_key, existing_uuid, code, snippet)
-                continue
-
-            if on_duplicate == "ignore":
-                logger.info("[INFO] Duplicate %s key=%s exists (uuid=%s) but attempting create anyway (ignore).",
-                            entity_name, src_key, existing_uuid)
-                # fall through to create
-
-        # CREATE
         if dry_run:
-            logger.info("[DRY] Would CREATE %s key=%s body=%s",
-                        entity_name, src_key, json.dumps(body, ensure_ascii=False))
-            written_map[src_key] = "dry-run-uuid"
+            log.info("[DRY] Would POST /staff.json :: %s",
+                     json.dumps(staff, ensure_ascii=False))
             created += 1
             continue
 
-        try:
-            data, resp = sm8_request(
-                "POST", target_resource, headers, json_body=body, basic_auth=basic_auth)
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", None)
-            snippet = (getattr(e.response, "text", "") or "")[:300]
-            logger.error("Failed to CREATE %s key=%s: HTTP %s :: %s",
-                         entity_name, src_key, code, snippet)
+        if email and email in existing_emails:
+            log.info("[SKIP] Staff exists (email): %s", email)
             continue
 
-        sm8_uuid = resp.headers.get(
-            "x-record-uuid") or (data or {}).get("uuid")
-        if sm8_uuid:
-            written_map[src_key] = sm8_uuid
-            logger.info("[OK] Created %s key=%s -> %s",
-                        entity_name, src_key, sm8_uuid)
-        else:
-            logger.info(
-                "[OK] Created %s key=%s (uuid not returned)", entity_name, src_key)
-        created += 1
-
-    if mapping_out:
         try:
-            mapping_out.parent.mkdir(parents=True, exist_ok=True)
-            mapping_out.write_text(json.dumps(
-                written_map, ensure_ascii=False, indent=2), encoding="utf-8")
-            logger.info("Wrote mapping file: %s", mapping_out)
-        except Exception as e:
-            logger.warning(
-                "Could not write mapping file %s: %s", mapping_out, e)
+            _, resp = sm8_request("POST", "/staff.json",
+                                  headers, json_body=staff)
+            sm8_uuid = resp.headers.get("x-record-uuid")
+            if email:
+                existing_emails.add(email)
+            log.info("[OK] Created staff %s -> %s",
+                     staff["email"], sm8_uuid or "(uuid n/a)")
+            created += 1
+        except requests.HTTPError as e:
+            code = getattr(e.response, "status_code", None)
+            body = (getattr(e.response, "text", "") or "")[:300]
+            log.error("Failed to create staff for email=%s: HTTP %s. Body: %s",
+                      staff["email"], code, body)
 
-    logger.info("[SUMMARY] %s processed=%d created=%d updated=%d skipped=%d",
-                entity_name, processed, created, updated, processed - (created + updated))
-
-# -------- Employees wiring (HCP -> SM8) --------
+    log.info("[SUMMARY] employees processed=%d created=%d skipped=%d",
+             processed, created, processed - created)
 
 
-def employees_src_key_selector(hcp: Dict[str, Any]) -> Optional[str]:
-    email = (hcp.get("email") or "").strip().lower()
-    return email or None
+def import_customers(run_dir: pathlib.Path, headers: Dict[str, str], *, dry_run: bool, limit: Optional[int], skip: int) -> None:
+    """
+    Implements your rules:
+      - If no company: create a single Client (individual). No Company Contact.
+      - If company present: upsert Client (company), upsert Site (by address), upsert Company Contact.
+      - Dedupe Clients & Contacts by (name OR email OR phone). Dedupe Site by (parent, address).
+    """
+    src = run_dir / "customers.ndjson"
+    if not src.exists():
+        log.warning(
+            "customers.ndjson not found in %s; nothing to import.", run_dir)
+        return
 
+    log.info("Importing customers from %s", src)
 
-def employees_existing_key_selector(sm8_obj: Dict[str, Any]) -> Optional[str]:
-    email = (sm8_obj.get("email") or "").strip().lower()
-    return email or None
+    # Preload caches
+    client_caches = preload_clients(headers)
+    contact_idx = preload_company_contacts(headers)
+
+    created_clients = 0
+    created_sites = 0
+    created_contacts = 0
+    processed = 0
+
+    for hcp in iter_ndjson(src):
+        processed += 1
+        if processed <= max(skip, 0):
+            continue
+        if limit is not None and (created_clients + created_sites + created_contacts) >= max(limit, 0):
+            break
+
+        comp = (hcp.get("company") or "").strip()
+        first = (hcp.get("first_name") or "").strip()
+        last = (hcp.get("last_name") or "").strip()
+        full_name = (f"{first} {last}".strip() or (hcp.get("email") or "").split(
+            "@")[0] if hcp.get("email") else "").strip()
+        email = (hcp.get("email") or "").strip()
+        phone = hcp.get("home_number") or hcp.get("work_number") or ""
+        mobile = hcp.get("mobile_number") or ""
+        address = pick_best_address(hcp)
+
+        if not comp:
+            # Individual client only
+            client_payload = map_hcp_to_sm8_company_object(
+                name=full_name or "Unknown Customer",
+                email=email, phone=phone, mobile=mobile,
+                address=address, is_individual=True
+            )
+            if dry_run:
+                log.info("[DRY] Would upsert Client (individual): %s",
+                         json.dumps(client_payload, ensure_ascii=False))
+            else:
+                try:
+                    _uuid = upsert_client(
+                        headers, client_caches, client_payload)
+                    created_clients += 1  # counts new; upsert_client only increments cache; we can't easily know if new vs existing -> treat as created attempt
+                except requests.HTTPError as e:
+                    log.error("Client (individual) failed: HTTP %s :: %s",
+                              getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+            continue
+
+        # Company path — company client
+        company_payload = map_hcp_to_sm8_company_object(
+            name=comp,
+            email="", phone="", mobile="",
+            address={"street": "", "city": "",
+                     "state": "", "zip": "", "country": ""},
+            is_individual=False
+        )
+        site_payload = map_hcp_to_sm8_company_object(
+            name=comp,  # SM8 lets site share the same name; dedupe is by address+parent
+            email=email, phone=phone, mobile=mobile,
+            address=address, is_individual=False,
+            parent_company_uuid="__PARENT__"  # placeholder; fill after we get parent uuid
+        )
+        contact_payload = map_hcp_to_sm8_company_contact("__PARENT__", hcp)
+
+        if dry_run:
+            log.info("[DRY] Would upsert Company Client: %s",
+                     json.dumps(company_payload, ensure_ascii=False))
+            log.info("[DRY] Would upsert Company Site (by address): %s", json.dumps(
+                {**site_payload, "parent_company_uuid": "<parent-uuid>"}, ensure_ascii=False))
+            log.info("[DRY] Would upsert Company Contact: %s", json.dumps(
+                {**contact_payload, "company_uuid": "<parent-uuid>"}, ensure_ascii=False))
+            continue
+
+        try:
+            parent_uuid = upsert_client(
+                headers, client_caches, company_payload)
+        except requests.HTTPError as e:
+            log.error("Company Client failed: HTTP %s :: %s",
+                      getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+            continue
+
+        # Site upsert (address-based)
+        site_payload["parent_company_uuid"] = parent_uuid
+        try:
+            _site_uuid = upsert_site(
+                headers, client_caches, parent_uuid, site_payload)
+        except requests.HTTPError as e:
+            log.error("Company Site failed: HTTP %s :: %s",
+                      getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+
+        # Contact upsert
+        contact_payload["company_uuid"] = parent_uuid
+        try:
+            _contact_uuid = upsert_company_contact(
+                headers, contact_idx, contact_payload)
+        except requests.HTTPError as e:
+            log.error("Company Contact failed: HTTP %s :: %s",
+                      getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+
+    log.info("[SUMMARY] customers processed=%d", processed)
 
 # -------- CLI --------
 
@@ -584,72 +816,48 @@ def main() -> None:
         "--ndjson-dir", help="Path to NDJSON run dir (or base dir when used with --latest). Default ./hcp_export")
     ap.add_argument("--latest", action="store_true",
                     help="Pick newest timestamped subfolder under --ndjson-dir (or ./hcp_export)")
-    ap.add_argument("--only", choices=["employees"], default="employees",
-                    help="Entity to import (currently only 'employees')")
+    ap.add_argument("--only", choices=["employees", "customers"],
+                    default="employees", help="Entity to import")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print actions but do not POST")
-    ap.add_argument("--limit", type=int, help="Import at most N records")
+    ap.add_argument("--limit", type=int,
+                    help="Import at most N records (per entity)")
     ap.add_argument("--skip", type=int, default=0,
                     help="Skip the first N source records")
-    ap.add_argument("--mapping-out",
-                    help="Write a JSON map of source-key -> SM8 uuid")
     ap.add_argument(
         "--dotenv", help="Path to .env file to load (otherwise auto-discovered)")
     ap.add_argument("--auth-mode", choices=["oauth", "apikey"],
                     help="Force auth mode (otherwise auto-detect)")
-    ap.add_argument("--on-duplicate", choices=["skip", "update", "ignore"], default="skip",
-                    help="Duplicate policy when a record with the same key already exists")
-    ap.add_argument("--no-preload", action="store_true",
-                    help="Disable preloading existing records (always try to create)")
-    ap.add_argument("--log-level", default="INFO",
-                    help="Logging level (DEBUG, INFO, WARNING, ERROR)")
-
     args = ap.parse_args()
 
-    setup_logging(args.log_level)
-
-    # Load env before anything else
-    used_env = load_env(args.dotenv)
-    if used_env:
-        logger.info("Loaded env from: %s", used_env)
+    # Load env
+    load_env(args.dotenv)
 
     # Resolve run directory
     run_dir = resolve_ndjson_dir(args.ndjson_dir, args.latest)
-    logger.info("Using NDJSON dir: %s", run_dir)
+    log.info("Using NDJSON dir: %s", run_dir)
     if not run_dir.exists():
         sys.exit(f"NDJSON dir not found: {run_dir}")
 
-    # Build auth
-    headers, basic_auth, _mode = build_auth_headers_and_method(args.auth_mode)
+    # Build headers (common)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "sm8-import/1.1 (+https://servicem8.com)",
+    }
+    headers, _basic_unused, _mode = build_auth(headers, args.auth_mode)
 
-    # Optional mapping output path
-    mapping_out = pathlib.Path(
-        args.mapping_out).resolve() if args.mapping_out else None
-
-    # Default SM8 security role can be passed via env SM8_DEFAULT_ROLE_UUID
+    # Default SM8 security role for staff can be passed via env SM8_DEFAULT_ROLE_UUID
     default_role_uuid = os.getenv("SM8_DEFAULT_ROLE_UUID") or None
 
     if args.only == "employees":
-        import_entities_generic(
-            entity_name="employees",
-            run_dir=run_dir,
-            source_filename="employees.ndjson",
-            target_resource="/staff.json",
-            headers=headers,
-            basic_auth=basic_auth,
-            map_func=lambda hcp: map_hcp_employee_to_sm8_staff(
-                hcp, default_role_uuid=default_role_uuid),
-            src_key_selector=employees_src_key_selector,
-            existing_key_selector=employees_existing_key_selector,
-            on_duplicate=args.on_duplicate,
-            dry_run=args.dry_run,
-            limit=args.limit,
-            skip=args.skip,
-            mapping_out=mapping_out,
-            preload=not args.no_preload,
-        )
+        import_employees(run_dir, headers, dry_run=args.dry_run, limit=args.limit,
+                         skip=args.skip, default_role_uuid=default_role_uuid)
+    elif args.only == "customers":
+        import_customers(run_dir, headers, dry_run=args.dry_run,
+                         limit=args.limit, skip=args.skip)
     else:
-        logger.warning("No importer implemented for the selected entity.")
+        log.warning("No importer implemented for the selected entity.")
 
 
 if __name__ == "__main__":
