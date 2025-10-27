@@ -2,7 +2,7 @@
 """
 ServiceM8 Import & Dump Tool
 
-What's new:
+Features:
   - Logging controls:
       --quiet (hide INFO), --silent (hide almost everything),
       --log-file PATH (write logs to file), --no-console (no terminal logging).
@@ -11,10 +11,11 @@ What's new:
   - Sites are companies with parent_company_uuid; dedupe via parent+address.
   - Dump mode to export all Clients + Company Contacts to one JSON file.
   - Per-run, timestamped audit and dump file names.
+  - For individual clients, also creates a BILLING + primary Company Contact.
 
 Usage examples:
   # Dump all without printing to terminal, write logs to file, paced at 120 rpm
-  python sm8_import.py --dump-all --dump-file ./export/clients_contacts.json \
+  python sm8_import.py --dump-all --dump-file ./sm8_export/ \
     --audit-file ./audit/dump.ndjson --no-console --log-file ./logs/run.log --rpm 120
 
   # Customers only, dry-run, detailed audit on newest export
@@ -165,6 +166,10 @@ def list_timestamp_dirs(root: pathlib.Path) -> List[pathlib.Path]:
 
 
 def resolve_ndjson_dir(base_or_run: Optional[str], latest: bool) -> pathlib.Path:
+    """
+    If latest is True, pick newest timestamped subfolder under base_or_run or ./hcp_export.
+    Else, base_or_run must be a specific run directory.
+    """
     if latest:
         base = pathlib.Path(base_or_run or "./hcp_export").resolve()
         runs = list_timestamp_dirs(base)
@@ -497,7 +502,13 @@ def map_company_payload(
     return {k: v for k, v in obj.items() if v not in (None, "", [])}
 
 
-def map_contact_payload(company_uuid: str, hcp_customer: Dict[str, Any]) -> Dict[str, Any]:
+def map_contact_payload(
+    company_uuid: str,
+    hcp_customer: Dict[str, Any],
+    *,
+    type_value: Optional[str] = None,
+    primary: bool = False,
+) -> Dict[str, Any]:
     first = (hcp_customer.get("first_name") or "").strip()
     last = (hcp_customer.get("last_name") or "").strip()
     email = (hcp_customer.get("email") or "").strip()
@@ -512,6 +523,10 @@ def map_contact_payload(company_uuid: str, hcp_customer: Dict[str, Any]) -> Dict
         "phone": phone or None,
         "mobile": mobile or None,
     }
+    if type_value:
+        obj["type"] = type_value            # e.g. "BILLING"
+    if primary:
+        obj["is_primary_contact"] = 1       # mark as primary
     return {k: v for k, v in obj.items() if v not in (None, "", [])}
 
 
@@ -577,12 +592,18 @@ def find_contact(
     email: str,
     phone: str,
     mobile: str,
+    # scope search to a company when available
+    company_uuid: Optional[str] = None,
     audit: Optional[pathlib.Path],
     audit_detail: bool,
 ) -> Optional[str]:
+    base_conds: List[Tuple[str, str, Any]] = []
+    if company_uuid:
+        base_conds.append(("company_uuid", "eq", company_uuid))
+
     # Email
     if email:
-        flt = odata_filter([("email", "eq", email)])
+        flt = odata_filter(base_conds + [("email", "eq", email)])
         data, _ = sm8_request("GET", "/companycontact.json", headers,
                               params={"$filter": flt},
                               audit=audit, audit_detail=audit_detail,
@@ -590,11 +611,12 @@ def find_contact(
         rows = data if isinstance(data, list) else []
         if rows:
             return _row_uuid(rows[0])
+
     # Phones
     for field, val in (("mobile", mobile), ("phone", phone)):
         if not val:
             continue
-        flt = odata_filter([(field, "eq", val)])
+        flt = odata_filter(base_conds + [(field, "eq", val)])
         data, _ = sm8_request("GET", "/companycontact.json", headers,
                               params={"$filter": flt},
                               audit=audit, audit_detail=audit_detail,
@@ -602,9 +624,11 @@ def find_contact(
         rows = data if isinstance(data, list) else []
         if rows:
             return _row_uuid(rows[0])
-    # Name (requires both first and last to be reliable)
+
+    # Name
     if first or last:
-        flt = odata_filter([("first", "eq", first), ("last", "eq", last)])
+        flt = odata_filter(
+            base_conds + [("first", "eq", first), ("last", "eq", last)])
         data, _ = sm8_request("GET", "/companycontact.json", headers,
                               params={"$filter": flt},
                               audit=audit, audit_detail=audit_detail,
@@ -761,7 +785,7 @@ def import_employees(
             if not nxt:
                 break
             cursor = nxt
-    except requests.HTTPError as e:
+    except requests.HTTPError:
         pass
 
     for hcp in iter_ndjson(src):
@@ -833,7 +857,7 @@ def import_customers(
 ) -> None:
     """
     Rules:
-      - If no company: create/find a single Client (individual). No Company Contact.
+      - If no company: create/find a single Client (individual), THEN create a BILLING + primary Company Contact.
       - If company present: upsert Company Client (by name), upsert Site by address (parent_company_uuid + address_*),
         upsert Company Contact (dedupe by email OR phone/mobile OR first+last).
       - No heavy preloads: on-demand OData lookups per record.
@@ -868,22 +892,44 @@ def import_customers(
         mobile = hcp.get("mobile_number") or ""
         address = pick_best_address(hcp)
 
-        # No company: single Client (individual). No company contact.
+        # No company: single Client (individual) + create a BILLING primary contact
         if not comp:
             client_name = full_name or "Unknown Customer"
-            existing_uuid = find_company_by_name(
-                headers, name=client_name, audit=audit, audit_detail=audit_detail)
-            if existing_uuid:
-                continue
 
-            client_payload = map_company_payload(
-                name=client_name,
-                address=address,
-                is_individual=True
+            # find or create the individual client
+            client_uuid = find_company_by_name(
+                headers, name=client_name, audit=audit, audit_detail=audit_detail
             )
-            uuid = create_company(headers, payload=client_payload,
-                                  dry_run=dry_run, audit=audit, audit_detail=audit_detail)
-            created_clients += 1
+            if not client_uuid:
+                client_payload = map_company_payload(
+                    name=client_name,
+                    address=address,
+                    is_individual=True
+                )
+                client_uuid = create_company(
+                    headers, payload=client_payload, dry_run=dry_run,
+                    audit=audit, audit_detail=audit_detail
+                )
+                created_clients += 1
+
+            # create/dedupe the BILLING + primary contact for the individual
+            contact_uuid = find_contact(
+                headers,
+                first=first, last=last, email=email, phone=phone, mobile=mobile,
+                company_uuid=client_uuid,
+                audit=audit, audit_detail=audit_detail
+            )
+            if not contact_uuid:
+                contact_payload = map_contact_payload(
+                    client_uuid, hcp, type_value="BILLING", primary=True
+                )
+                contact_uuid = create_contact(
+                    headers, payload=contact_payload, dry_run=dry_run,
+                    audit=audit, audit_detail=audit_detail
+                )
+                if contact_uuid:
+                    created_contacts += 1
+
             continue
 
         # Company client (head office)
@@ -918,7 +964,8 @@ def import_customers(
 
         # Company contact (keeps email/phone/mobile)
         contact_uuid = find_contact(headers, first=first, last=last, email=email,
-                                    phone=phone, mobile=mobile, audit=audit, audit_detail=audit_detail)
+                                    phone=phone, mobile=mobile, company_uuid=parent_uuid,
+                                    audit=audit, audit_detail=audit_detail)
         if not contact_uuid:
             contact_payload = map_contact_payload(parent_uuid, hcp)
             contact_uuid = create_contact(
@@ -995,7 +1042,7 @@ def main() -> None:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "sm8-import/1.5 (+https://servicem8.com)",
+        "User-Agent": "sm8-import/1.6 (+https://servicem8.com)",
     }
     headers, _mode = build_auth(headers, args.auth_mode)
 
@@ -1004,7 +1051,6 @@ def main() -> None:
         args.audit_file).resolve() if args.audit_file else None
     audit_path = _roll_timestamped_file(
         audit_base, label="Audit file")  # may be None
-
 
     # DUMP MODE
     if args.dump_all:
