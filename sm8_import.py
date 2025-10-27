@@ -12,6 +12,8 @@ Features:
   - Dump mode to export all Clients + Company Contacts to one JSON file.
   - Per-run, timestamped audit and dump file names.
   - For individual clients, also creates a BILLING + primary Company Contact.
+  - Force `active: 1` on create for Companies and Company Contacts.
+  - NEW: Reactivation mode to flip inactive Companies and/or Company Contacts to active.
 
 Usage examples:
   # Dump all without printing to terminal, write logs to file, paced at 120 rpm
@@ -21,6 +23,12 @@ Usage examples:
   # Customers only, dry-run, detailed audit on newest export
   python sm8_import.py --latest --only customers --limit 5 \
     --dry-run --audit-file ./audit/customers.ndjson --audit-detail --rpm 120
+
+  # Reactivate inactive companies
+  python sm8_import.py --activate-inactive companies --audit-file ./audit/reactivate.ndjson
+
+  # Reactivate inactive companies and contacts, no console logs
+  python sm8_import.py --activate-inactive both --no-console --log-file ./logs/reactivate.log
 """
 
 from __future__ import annotations
@@ -457,7 +465,7 @@ def sm8_request(
     raise RuntimeError(
         f"sm8_request: exhausted {retries} attempts for {method.upper()} {resource}")
 
-# ---------------- Lookups & Creation ----------------
+# ---------------- Lookups, Creation & Updates ----------------
 
 
 def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
@@ -496,6 +504,7 @@ def map_company_payload(
         "address_postcode": address.get("zip") or None,
         "address_country": address.get("country") or None,
         "is_individual": 1 if is_individual else 0,
+        "active": 1,  # Force active on creation
     }
     if parent_company_uuid:
         obj["parent_company_uuid"] = parent_company_uuid
@@ -522,6 +531,7 @@ def map_contact_payload(
         "email": email or None,
         "phone": phone or None,
         "mobile": mobile or None,
+        "active": 1,  # Force active on creation
     }
     if type_value:
         obj["type"] = type_value            # e.g. "BILLING"
@@ -572,10 +582,8 @@ def find_site_by_address(
     if postcode:
         conds.append(("address_postcode", "eq", postcode))
     flt = odata_filter(conds)
-    if not flt:
-        return None
     data, _ = sm8_request("GET", "/company.json", headers,
-                          params={"$filter": flt},
+                          params={"$filter": flt} if flt else None,
                           audit=audit, audit_detail=audit_detail,
                           entity="clients", action="lookup_site", key=f"parent={parent_uuid}")
     rows = data if isinstance(data, list) else []
@@ -592,7 +600,6 @@ def find_contact(
     email: str,
     phone: str,
     mobile: str,
-    # scope search to a company when available
     company_uuid: Optional[str] = None,
     audit: Optional[pathlib.Path],
     audit_detail: bool,
@@ -688,7 +695,7 @@ def create_contact(
     uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
     return uuid
 
-# ---------------- Dump helpers ----------------
+# ---------------- Dump & Reactivation helpers ----------------
 
 
 def _collect_all(
@@ -710,6 +717,35 @@ def _collect_all(
                                  params=params,
                                  audit=audit, audit_detail=audit_detail,
                                  entity=entity, action="dump", key=f"cursor={cursor}")
+        rows = data if isinstance(data, list) else []
+        out.extend(rows)
+        nxt = resp.headers.get("x-next-cursor")
+        if not nxt:
+            break
+        cursor = nxt
+    return out
+
+
+def _collect_all_with_filter(
+    headers: Dict[str, str],
+    resource: str,
+    *,
+    entity: str,
+    flt: Optional[str],
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> List[Dict[str, Any]]:
+    """Collect all rows with an optional $filter, using cursor pagination."""
+    cursor = "-1"
+    out: List[Dict[str, Any]] = []
+    while True:
+        params: Dict[str, Any] = {"cursor": cursor}
+        if flt:
+            params["$filter"] = flt
+        data, resp = sm8_request("GET", resource, headers,
+                                 params=params,
+                                 audit=audit, audit_detail=audit_detail,
+                                 entity=entity, action="scan", key=f"cursor={cursor}")
         rows = data if isinstance(data, list) else []
         out.extend(rows)
         nxt = resp.headers.get("x-next-cursor")
@@ -743,6 +779,85 @@ def dump_clients_and_contacts(
 
     log.info("[DUMP SUMMARY] clients=%d company_contacts=%d -> %s",
              len(clients), len(contacts), out_path)
+
+
+def _update_active_flag(
+    headers: Dict[str, str],
+    *,
+    resource: str,
+    entity: str,
+    uuid: str,
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> bool:
+    """POST update with uuid + active=1 to the given resource."""
+    payload = {"uuid": uuid, "active": 1}
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": entity, "action": "dry_post", "key": uuid,
+            "method": "POST", "resource": resource, "status": 0,
+            "request": {"json": payload},
+        }, detail=audit_detail)
+        return True
+
+    try:
+        sm8_request("POST", resource, headers,
+                    json_body=payload,
+                    audit=audit, audit_detail=audit_detail,
+                    entity=entity, action="activate", key=uuid)
+        return True
+    except requests.HTTPError:
+        return False
+
+
+def reactivate_inactive(
+    headers: Dict[str, str],
+    *,
+    scope: str,  # 'companies' | 'contacts' | 'both'
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> None:
+    """
+    Scan for inactive companies/contacts and flip them to active.
+    """
+    total_companies = total_contacts = 0
+    updated_companies = updated_contacts = 0
+
+    if scope in ("companies", "both"):
+        flt = odata_filter([("active", "eq", 0)])
+        companies = _collect_all_with_filter(
+            headers, "/company.json", entity="clients", flt=flt,
+            audit=audit, audit_detail=audit_detail
+        )
+        total_companies = len(companies)
+        for row in companies:
+            uid = _row_uuid(row)
+            if not uid:
+                continue
+            if _update_active_flag(headers, resource="/company.json", entity="clients",
+                                   uuid=uid, dry_run=dry_run, audit=audit, audit_detail=audit_detail):
+                updated_companies += 1
+        log.info("[REACTIVATE] companies inactive=%d updated=%d",
+                 total_companies, updated_companies)
+
+    if scope in ("contacts", "both"):
+        flt = odata_filter([("active", "eq", 0)])
+        contacts = _collect_all_with_filter(
+            headers, "/companycontact.json", entity="company_contacts", flt=flt,
+            audit=audit, audit_detail=audit_detail
+        )
+        total_contacts = len(contacts)
+        for row in contacts:
+            uid = _row_uuid(row)
+            if not uid:
+                continue
+            if _update_active_flag(headers, resource="/companycontact.json", entity="company_contacts",
+                                   uuid=uid, dry_run=dry_run, audit=audit, audit_detail=audit_detail):
+                updated_contacts += 1
+        log.info("[REACTIVATE] company_contacts inactive=%d updated=%d",
+                 total_contacts, updated_contacts)
 
 # ---------------- Importers ----------------
 
@@ -981,7 +1096,7 @@ def import_customers(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Import Housecall Pro NDJSON into ServiceM8, or dump Clients/Contacts to JSON")
+        description="Import Housecall Pro NDJSON into ServiceM8, dump Clients/Contacts, or reactivate inactive records")
 
     # Logging controls
     ap.add_argument("--quiet", action="store_true",
@@ -1002,6 +1117,10 @@ def main() -> None:
                     help="Fetch all Clients and Company Contacts to a single JSON file and exit")
     ap.add_argument(
         "--dump-file", help="Where to write the dump JSON (a timestamped copy will be created). Default: ./sm8_export/")
+
+    # Reactivation mode
+    ap.add_argument("--activate-inactive", choices=["companies", "contacts", "both"],
+                    help="Scan for inactive records and set active=1 (updates only).")
 
     # Import mode
     ap.add_argument(
@@ -1042,7 +1161,7 @@ def main() -> None:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "sm8-import/1.6 (+https://servicem8.com)",
+        "User-Agent": "sm8-import/1.7 (+https://servicem8.com)",
     }
     headers, _mode = build_auth(headers, args.auth_mode)
 
@@ -1052,9 +1171,19 @@ def main() -> None:
     audit_path = _roll_timestamped_file(
         audit_base, label="Audit file")  # may be None
 
+    # REACTIVATION MODE
+    if args.activate_inactive:
+        reactivate_inactive(
+            headers,
+            scope=args.activate_inactive,
+            dry_run=args.dry_run,
+            audit=audit_path,
+            audit_detail=args.audit_detail,
+        )
+        return
+
     # DUMP MODE
     if args.dump_all:
-        # Default to a directory, but create a file IN it: clients_contacts.json
         dump_base = pathlib.Path(args.dump_file).resolve(
         ) if args.dump_file else pathlib.Path("./sm8_export/").resolve()
         dump_path = _roll_timestamped_file(
