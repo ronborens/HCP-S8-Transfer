@@ -974,7 +974,7 @@ def main() -> None:
     # DUMP MODE (no imports, no NDJSON dir required)
     if args.dump_all:
         dump_base = pathlib.Path(args.dump_file).resolve(
-        ) if args.dump_file else pathlib.Path("./export/clients_contacts.json").resolve()
+        ) if args.dump_file else pathlib.Path("./sm8_export/").resolve()
         dump_path = _roll_timestamped_file(dump_base, label="Dump file")
         if dump_path is None:
             sys.exit("Internal error: dump file path could not be resolved.")
