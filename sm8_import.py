@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
 """
-ServiceM8 Import Script — Imports data from Housecall Pro NDJSON exports to ServiceM8.
+ServiceM8 Import Script — Imports data from Housecall Pro NDJSON exports to ServiceM8,
+and can also dump all Clients + Company Contacts to JSON.
 
-What's new in this version:
-  - "Strict" payload for /company.json (Option 1): ONLY documented fields are sent:
-      name, is_individual, parent_company_uuid, address_street, address_city,
-      address_state, address_postcode, address_country.
-    (No email/phone/mobile on companies; all comms lives on /companycontact.json.)
-  - Company dedupe only by name (per docs; email/phone are not filterable on /company.json).
-  - Sites are still just companies with parent_company_uuid; found via parent + address.
-  - DRY helpers for OData, auditing, lookups, and creation.
-  - Audit file now rolls a new timestamped file on each run when --audit-file is provided.
-  - Hardened retry client; re-raises last error when retries exhausted.
+What's new (dump mode):
+  - --dump-all + --dump-file write a single JSON file:
+      {
+        "clients": [ ... ],
+        "company_contacts": [ ... ]
+      }
+    using cursor-based pagination (no writes to ServiceM8).
+  - The dump file name is timestamped like <name>_YYYYMMDDTHHMMSSZ.json.
+  - Auditing applies to GET requests during dump (if --audit-file is set).
+
+Still includes:
+  - "Strict" payload for /company.json: ONLY documented fields are sent:
+    name, is_individual, parent_company_uuid, address_street, address_city,
+    address_state, address_postcode, address_country.
+  - Company dedupe by name only; site dedupe by parent+address via OData filters.
+  - DRY helpers for OData, auditing, lookups, retry/backoff HTTP client.
 
 Usage examples:
-  # Customers only, dry-run, with detailed audit on the newest export
+  # Dump only (no imports), with audit:
+  python sm8_import.py --dump-all --dump-file ./export/clients_contacts.json --audit-file ./audit/dump.ndjson --audit-detail
+
+  # Customers only, dry-run, detailed audit on the newest export
   python sm8_import.py --latest --only customers --limit 5 --dry-run --audit-file ./audit/customers.ndjson --audit-detail
 
   # Real run (employees)
   python sm8_import.py --latest --only employees
 
 Auth:
-  - OAuth bearer: set SM8_OAUTH_TOKEN (scopes: manage_staff, read_customers, manage_customers, read_customer_contacts, manage_customer_contacts)
+  - OAuth bearer: set SM8_OAUTH_TOKEN (scopes: manage_staff, read_customers, manage_customers,
+    read_customer_contacts, manage_customer_contacts)
   - API key: set SM8_API_KEY (smk-...) — sent as X-Api-Key
   - Force mode via --auth-mode oauth|apikey (auto-detect otherwise)
 
 Notes:
   - “Clients” (and “Sites”) live at /company.json
   - “Company Contacts” live at /companycontact.json
-  - Dry-run NEVER POSTs; it logs a “dry_post” audit record with the payload.
+  - Dry-run NEVER POSTs; it logs “dry_post” audit records with payloads.
 """
 
 from __future__ import annotations
@@ -216,25 +227,25 @@ def odata_filter(conditions: List[Tuple[str, str, Any]]) -> str:
         parts.append(f"{field} {op} {_quote_odata_value(value)}")
     return " and ".join(parts)
 
-# ---------------- Auditing ----------------
+# ---------------- Auditing & Timestamped files ----------------
 
 
-def _ensure_audit_file(audit_path: Optional[pathlib.Path]) -> Optional[pathlib.Path]:
+def _roll_timestamped_file(base_path: Optional[pathlib.Path], *, label: str) -> Optional[pathlib.Path]:
     """
-    If --audit-file is provided, roll a new timestamped file alongside it:
-      ./audit/customers.ndjson -> ./audit/customers_YYYYMMDDTHHMMSSZ.ndjson
-    Returns the resolved path to the rolled file (or None).
+    Given a base path (e.g., ./audit/customers.ndjson or ./export/clients_contacts.json),
+    create a sibling file with a UTC timestamp suffix: <stem>_YYYYMMDDTHHMMSSZ<suffix>
+    Returns the rolled path or None if base_path is None.
     """
-    if not audit_path:
+    if not base_path:
         return None
-    audit_path = audit_path.resolve()
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
-    stem = audit_path.stem
-    suffix = audit_path.suffix or ".ndjson"
+    base_path = base_path.resolve()
+    base_path.parent.mkdir(parents=True, exist_ok=True)
+    stem = base_path.stem
+    suffix = base_path.suffix or ".ndjson"
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    rolled = audit_path.with_name(f"{stem}_{ts}{suffix}")
+    rolled = base_path.with_name(f"{stem}_{ts}{suffix}")
     rolled.touch()
-    log.info("Audit file: %s", rolled)
+    log.info("%s: %s", label, rolled)
     return rolled
 
 
@@ -619,6 +630,62 @@ def create_contact(
     uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
     return uuid
 
+# ---------------- Dump helpers (cursor-based pagination) ----------------
+
+
+def _collect_all(
+    headers: Dict[str, str],
+    resource: str,
+    *,
+    entity: str,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Collect all rows from an endpoint using cursor-based pagination.
+    """
+    cursor = "-1"
+    out: List[Dict[str, Any]] = []
+    while True:
+        params = {"cursor": cursor}
+        data, resp = sm8_request("GET", resource, headers,
+                                 params=params,
+                                 audit=audit, audit_detail=audit_detail,
+                                 entity=entity, action="dump", key=f"cursor={cursor}")
+        rows = data if isinstance(data, list) else []
+        out.extend(rows)
+        nxt = resp.headers.get("x-next-cursor")
+        if not nxt:
+            break
+        cursor = nxt
+    return out
+
+
+def dump_clients_and_contacts(
+    headers: Dict[str, str],
+    *,
+    out_path: pathlib.Path,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> None:
+    """
+    Dump all Clients and Company Contacts to a single JSON file:
+      { "clients": [...], "company_contacts": [...] }
+    """
+    log.info("Dumping Clients and Company Contacts to %s ...", out_path)
+    clients = _collect_all(headers, "/company.json",
+                           entity="clients", audit=audit, audit_detail=audit_detail)
+    contacts = _collect_all(headers, "/companycontact.json",
+                            entity="company_contacts", audit=audit, audit_detail=audit_detail)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump({"clients": clients, "company_contacts": contacts},
+                  f, ensure_ascii=False, indent=2)
+
+    log.info("[DUMP SUMMARY] clients=%d company_contacts=%d -> %s",
+             len(clients), len(contacts), out_path)
+
 # ---------------- Importers ----------------
 
 
@@ -856,7 +923,14 @@ def import_customers(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Import Housecall Pro NDJSON into ServiceM8")
+        description="Import Housecall Pro NDJSON into ServiceM8, or dump Clients/Contacts to JSON")
+    # Dump mode (mutually independent of import mode)
+    ap.add_argument("--dump-all", action="store_true",
+                    help="Fetch all Clients and Company Contacts to a single JSON file and exit")
+    ap.add_argument(
+        "--dump-file", help="Where to write the dump JSON (a timestamped copy will be created). Default: ./export/clients_contacts.json")
+
+    # Import mode
     ap.add_argument(
         "--ndjson-dir", help="Path to NDJSON run dir (or base dir when used with --latest). Default ./hcp_export")
     ap.add_argument("--latest", action="store_true",
@@ -883,24 +957,36 @@ def main() -> None:
     # Load env
     load_env(args.dotenv)
 
-    # Resolve run directory
+    # Build headers (common)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "sm8-import/1.4 (+https://servicem8.com)",
+    }
+    headers, _mode = build_auth(headers, args.auth_mode)
+
+    # Audit setup (roll a new file each run if provided)
+    audit_base = pathlib.Path(
+        args.audit_file).resolve() if args.audit_file else None
+    audit_path = _roll_timestamped_file(
+        audit_base, label="Audit file")  # may be None
+
+    # DUMP MODE (no imports, no NDJSON dir required)
+    if args.dump_all:
+        dump_base = pathlib.Path(args.dump_file).resolve(
+        ) if args.dump_file else pathlib.Path("./export/clients_contacts.json").resolve()
+        dump_path = _roll_timestamped_file(dump_base, label="Dump file")
+        if dump_path is None:
+            sys.exit("Internal error: dump file path could not be resolved.")
+        dump_clients_and_contacts(
+            headers, out_path=dump_path, audit=audit_path, audit_detail=args.audit_detail)
+        return
+
+    # IMPORT MODE (requires NDJSON dir)
     run_dir = resolve_ndjson_dir(args.ndjson_dir, args.latest)
     log.info("Using NDJSON dir: %s", run_dir)
     if not run_dir.exists():
         sys.exit(f"NDJSON dir not found: {run_dir}")
-
-    # Build headers
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "sm8-import/1.3 (+https://servicem8.com)",
-    }
-    headers, _mode = build_auth(headers, args.auth_mode)
-
-    # Audit setup (roll a new file each run)
-    audit_base = pathlib.Path(
-        args.audit_file).resolve() if args.audit_file else None
-    audit_path = _ensure_audit_file(audit_base)
 
     # Default SM8 security role for staff can be passed via env SM8_DEFAULT_ROLE_UUID
     default_role_uuid = os.getenv("SM8_DEFAULT_ROLE_UUID") or None
