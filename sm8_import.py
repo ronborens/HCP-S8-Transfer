@@ -12,8 +12,15 @@ Features:
   - Dump mode to export all Clients + Company Contacts to one JSON file.
   - Per-run, timestamped audit and dump file names.
   - For individual clients, also creates a BILLING + primary Company Contact.
-  - Force `active: 1` on create for Companies and Company Contacts.
-  - NEW: Reactivation mode to flip inactive Companies and/or Company Contacts to active.
+  - Reactivation tools:
+      --activate-inactive {off,clients,contacts,both}
+      --reactivate-from {live,hcp}
+    Respects --limit for how many records to activate.
+  - Address merge on existing *individual* clients:
+      --merge-address {off,missing,always} (default: missing)
+    missing: only fills blank addr fields from HCP
+    always:  overwrites addr fields (when HCP has a value)
+    off:     no address changes on existing records
 
 Usage examples:
   # Dump all without printing to terminal, write logs to file, paced at 120 rpm
@@ -24,11 +31,9 @@ Usage examples:
   python sm8_import.py --latest --only customers --limit 5 \
     --dry-run --audit-file ./audit/customers.ndjson --audit-detail --rpm 120
 
-  # Reactivate inactive companies
-  python sm8_import.py --activate-inactive companies --audit-file ./audit/reactivate.ndjson
-
-  # Reactivate inactive companies and contacts, no console logs
-  python sm8_import.py --activate-inactive both --no-console --log-file ./logs/reactivate.log
+  # Reactivate up to 3 inactive records found by matching your HCP export (customers.ndjson)
+  python sm8_import.py --activate-inactive both --reactivate-from hcp --latest \
+    --limit 3 --audit-file ./audit/reactivate.ndjson --audit-detail --rpm 120
 """
 
 from __future__ import annotations
@@ -336,8 +341,7 @@ def _enforce_rpm():
     while dq and (now - dq[0]) > window:
         dq.popleft()
     if len(dq) >= rpm:
-        sleep_for = window - (now - dq[0]) + \
-            random.uniform(0, 0.25)  # tiny jitter
+        sleep_for = window - (now - dq[0]) + random.uniform(0, 0.25)  # tiny jitter
         if sleep_for > 0:
             time.sleep(sleep_for)
         # prune again
@@ -368,8 +372,7 @@ def sm8_request(
     Generic request wrapper for ServiceM8 API with retries on 429/5xx + network hiccups.
     Returns (parsed_json_or_None, Response). Raises on non-transient 4xx/5xx.
     """
-    assert resource.startswith(
-        "/"), "resource should start with '/' (e.g. '/staff.json')"
+    assert resource.startswith("/"), "resource should start with '/' (e.g. '/staff.json')"
     url = f"{SM8_BASE_URL}{resource}"
     session = get_session()
     backoff = 1.0
@@ -404,8 +407,7 @@ def sm8_request(
                 if retry_after and retry_after.isdigit():
                     sleep_for = min(int(retry_after), backoff_cap)
                 else:
-                    sleep_for = min(backoff + random.uniform(0,
-                                    backoff * 0.25), backoff_cap)
+                    sleep_for = min(backoff + random.uniform(0, backoff * 0.25), backoff_cap)
                 log.warning("Transient HTTP %s on %s %s. Attempt %d/%d. Sleeping %.1fs.",
                             r.status_code, method.upper(), resource, attempt, retries, sleep_for)
                 time.sleep(sleep_for)
@@ -415,8 +417,7 @@ def sm8_request(
             # Non-transient error
             if r.status_code >= 400:
                 snippet = (r.text or "")[:500]
-                log.error("%s %s -> HTTP %s :: %s", method.upper(),
-                          resource, r.status_code, snippet)
+                log.error("%s %s -> HTTP %s :: %s", method.upper(), resource, r.status_code, snippet)
                 _append_audit(audit, {
                     "ts": time.time(), "entity": entity, "action": action or "error", "key": key,
                     "method": method.upper(), "resource": resource, "status": r.status_code,
@@ -447,8 +448,7 @@ def sm8_request(
             last_exc = e
             if attempt == retries:
                 break
-            sleep_for = min(backoff + random.uniform(0,
-                            backoff * 0.25), backoff_cap)
+            sleep_for = min(backoff + random.uniform(0, backoff * 0.25), backoff_cap)
             log.warning("Network error (%s) on %s %s. Attempt %d/%d. Sleeping %.1fs.",
                         type(e).__name__, method.upper(), resource, attempt, retries, sleep_for)
             time.sleep(sleep_for)
@@ -462,10 +462,9 @@ def sm8_request(
     }, detail=audit_detail)
     if last_exc:
         raise last_exc
-    raise RuntimeError(
-        f"sm8_request: exhausted {retries} attempts for {method.upper()} {resource}")
+    raise RuntimeError(f"sm8_request: exhausted {retries} attempts for {method.upper()} {resource}")
 
-# ---------------- Lookups, Creation & Updates ----------------
+# ---------------- Lookups & Creation ----------------
 
 
 def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
@@ -473,10 +472,8 @@ def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
     Prefer a 'service' address; fall back to 'billing'. Returns keys: street, city, state, zip, country.
     """
     addrs = hcp_customer.get("addresses") or []
-    service = next((a for a in addrs if (
-        a.get("type") or "").lower() == "service"), None)
-    billing = next((a for a in addrs if (
-        a.get("type") or "").lower() == "billing"), None)
+    service = next((a for a in addrs if (a.get("type") or "").lower() == "service"), None)
+    billing = next((a for a in addrs if (a.get("type") or "").lower() == "billing"), None)
     a = service or billing or {}
     return {
         "street": a.get("street") or a.get("street_line_1") or "",
@@ -504,7 +501,6 @@ def map_company_payload(
         "address_postcode": address.get("zip") or None,
         "address_country": address.get("country") or None,
         "is_individual": 1 if is_individual else 0,
-        "active": 1,  # Force active on creation
     }
     if parent_company_uuid:
         obj["parent_company_uuid"] = parent_company_uuid
@@ -521,8 +517,7 @@ def map_contact_payload(
     first = (hcp_customer.get("first_name") or "").strip()
     last = (hcp_customer.get("last_name") or "").strip()
     email = (hcp_customer.get("email") or "").strip()
-    phone = hcp_customer.get(
-        "home_number") or hcp_customer.get("work_number") or ""
+    phone = hcp_customer.get("home_number") or hcp_customer.get("work_number") or ""
     mobile = hcp_customer.get("mobile_number") or ""
     obj = {
         "company_uuid": company_uuid,
@@ -531,7 +526,6 @@ def map_contact_payload(
         "email": email or None,
         "phone": phone or None,
         "mobile": mobile or None,
-        "active": 1,  # Force active on creation
     }
     if type_value:
         obj["type"] = type_value            # e.g. "BILLING"
@@ -553,7 +547,7 @@ def find_company_by_name(
     data, _ = sm8_request("GET", "/company.json", headers,
                           params={"$filter": flt},
                           audit=audit, audit_detail=audit_detail,
-                          entity="clients", action="lookup", key=f"name={name}")
+                          entity="clients", action="lookup_row", key=flt)
     rows = data if isinstance(data, list) else []
     if rows:
         return _row_uuid(rows[0])
@@ -571,8 +565,7 @@ def find_site_by_address(
     audit: Optional[pathlib.Path],
     audit_detail: bool,
 ) -> Optional[str]:
-    conds: List[Tuple[str, str, Any]] = [
-        ("parent_company_uuid", "eq", parent_uuid)]
+    conds: List[Tuple[str, str, Any]] = [("parent_company_uuid", "eq", parent_uuid)]
     if street:
         conds.append(("address_street", "eq", street))
     if city:
@@ -582,8 +575,10 @@ def find_site_by_address(
     if postcode:
         conds.append(("address_postcode", "eq", postcode))
     flt = odata_filter(conds)
+    if not flt:
+        return None
     data, _ = sm8_request("GET", "/company.json", headers,
-                          params={"$filter": flt} if flt else None,
+                          params={"$filter": flt},
                           audit=audit, audit_detail=audit_detail,
                           entity="clients", action="lookup_site", key=f"parent={parent_uuid}")
     rows = data if isinstance(data, list) else []
@@ -600,6 +595,7 @@ def find_contact(
     email: str,
     phone: str,
     mobile: str,
+    # scope search to a company when available
     company_uuid: Optional[str] = None,
     audit: Optional[pathlib.Path],
     audit_detail: bool,
@@ -614,7 +610,7 @@ def find_contact(
         data, _ = sm8_request("GET", "/companycontact.json", headers,
                               params={"$filter": flt},
                               audit=audit, audit_detail=audit_detail,
-                              entity="company_contacts", action="lookup", key=f"email={email}")
+                              entity="company_contacts", action="lookup_row", key=flt)
         rows = data if isinstance(data, list) else []
         if rows:
             return _row_uuid(rows[0])
@@ -627,19 +623,18 @@ def find_contact(
         data, _ = sm8_request("GET", "/companycontact.json", headers,
                               params={"$filter": flt},
                               audit=audit, audit_detail=audit_detail,
-                              entity="company_contacts", action="lookup", key=f"{field}={val}")
+                              entity="company_contacts", action="lookup_row", key=flt)
         rows = data if isinstance(data, list) else []
         if rows:
             return _row_uuid(rows[0])
 
     # Name
     if first or last:
-        flt = odata_filter(
-            base_conds + [("first", "eq", first), ("last", "eq", last)])
+        flt = odata_filter(base_conds + [("first", "eq", first), ("last", "eq", last)])
         data, _ = sm8_request("GET", "/companycontact.json", headers,
                               params={"$filter": flt},
                               audit=audit, audit_detail=audit_detail,
-                              entity="company_contacts", action="lookup", key=f"name={first} {last}".strip())
+                              entity="company_contacts", action="lookup_row", key=flt)
         rows = data if isinstance(data, list) else []
         if rows:
             return _row_uuid(rows[0])
@@ -695,7 +690,72 @@ def create_contact(
     uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
     return uuid
 
-# ---------------- Dump & Reactivation helpers ----------------
+# ---------------- Address merge helper ----------------
+
+
+def _fetch_company_by_uuid(headers: Dict[str, str], uuid: str,
+                           audit: Optional[pathlib.Path], audit_detail: bool) -> Optional[Dict[str, Any]]:
+    flt = odata_filter([("uuid", "eq", uuid)])
+    data, _ = sm8_request("GET", "/company.json", headers,
+                          params={"$filter": flt},
+                          audit=audit, audit_detail=audit_detail,
+                          entity="clients", action="get", key=uuid)
+    rows = data if isinstance(data, list) else []
+    return rows[0] if rows else None
+
+
+def maybe_merge_address_into_individual(
+    headers: Dict[str, str],
+    *,
+    company_uuid: str,
+    hcp_address: Dict[str, str],
+    mode: str,  # "off" | "missing" | "always"
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> bool:
+    """
+    For existing INDIVIDUAL client only: merge or overwrite address from HCP according to mode.
+    Returns True if an update POST was made.
+    """
+    if mode == "off" or not any(hcp_address.values()):
+        return False
+
+    row = _fetch_company_by_uuid(headers, company_uuid, audit, audit_detail)
+    if not row:
+        return False
+    if not (row.get("is_individual") in (1, True)):  # only touch individuals
+        return False
+
+    # Build patch
+    mapping = [
+        ("address_street", "street"),
+        ("address_city", "city"),
+        ("address_state", "state"),
+        ("address_postcode", "zip"),
+        ("address_country", "country"),
+    ]
+    patch: Dict[str, Any] = {"uuid": company_uuid}
+
+    for field, akey in mapping:
+        new_val = (hcp_address.get(akey) or "").strip()
+        if not new_val:
+            continue
+        if mode == "always":
+            patch[field] = new_val
+        elif mode == "missing":
+            cur = (row.get(field) or "").strip()
+            if not cur:
+                patch[field] = new_val
+
+    if len(patch) > 1:
+        sm8_request("POST", "/company.json", headers,
+                    json_body=patch,
+                    audit=audit, audit_detail=audit_detail,
+                    entity="clients", action="merge_address", key=company_uuid)
+        return True
+    return False
+
+# ---------------- Dump helpers ----------------
 
 
 def _collect_all(
@@ -717,35 +777,6 @@ def _collect_all(
                                  params=params,
                                  audit=audit, audit_detail=audit_detail,
                                  entity=entity, action="dump", key=f"cursor={cursor}")
-        rows = data if isinstance(data, list) else []
-        out.extend(rows)
-        nxt = resp.headers.get("x-next-cursor")
-        if not nxt:
-            break
-        cursor = nxt
-    return out
-
-
-def _collect_all_with_filter(
-    headers: Dict[str, str],
-    resource: str,
-    *,
-    entity: str,
-    flt: Optional[str],
-    audit: Optional[pathlib.Path],
-    audit_detail: bool,
-) -> List[Dict[str, Any]]:
-    """Collect all rows with an optional $filter, using cursor pagination."""
-    cursor = "-1"
-    out: List[Dict[str, Any]] = []
-    while True:
-        params: Dict[str, Any] = {"cursor": cursor}
-        if flt:
-            params["$filter"] = flt
-        data, resp = sm8_request("GET", resource, headers,
-                                 params=params,
-                                 audit=audit, audit_detail=audit_detail,
-                                 entity=entity, action="scan", key=f"cursor={cursor}")
         rows = data if isinstance(data, list) else []
         out.extend(rows)
         nxt = resp.headers.get("x-next-cursor")
@@ -780,84 +811,132 @@ def dump_clients_and_contacts(
     log.info("[DUMP SUMMARY] clients=%d company_contacts=%d -> %s",
              len(clients), len(contacts), out_path)
 
+# ---------------- Reactivation helpers ----------------
 
-def _update_active_flag(
+
+def _activate_company_uuid(headers: Dict[str, str], uuid: str,
+                           audit: Optional[pathlib.Path], audit_detail: bool) -> None:
+    sm8_request("POST", "/company.json", headers,
+                json_body={"uuid": uuid, "active": 1},
+                audit=audit, audit_detail=audit_detail,
+                entity="clients", action="activate", key=uuid)
+
+
+def _activate_contact_uuid(headers: Dict[str, str], uuid: str,
+                           audit: Optional[pathlib.Path], audit_detail: bool) -> None:
+    sm8_request("POST", "/companycontact.json", headers,
+                json_body={"uuid": uuid, "active": 1},
+                audit=audit, audit_detail=audit_detail,
+                entity="company_contacts", action="activate", key=uuid)
+
+
+def reactivate_from_live(
     headers: Dict[str, str],
     *,
-    resource: str,
-    entity: str,
-    uuid: str,
-    dry_run: bool,
-    audit: Optional[pathlib.Path],
-    audit_detail: bool,
-) -> bool:
-    """POST update with uuid + active=1 to the given resource."""
-    payload = {"uuid": uuid, "active": 1}
-    if dry_run:
-        _append_audit(audit, {
-            "ts": time.time(), "entity": entity, "action": "dry_post", "key": uuid,
-            "method": "POST", "resource": resource, "status": 0,
-            "request": {"json": payload},
-        }, detail=audit_detail)
-        return True
-
-    try:
-        sm8_request("POST", resource, headers,
-                    json_body=payload,
-                    audit=audit, audit_detail=audit_detail,
-                    entity=entity, action="activate", key=uuid)
-        return True
-    except requests.HTTPError:
-        return False
-
-
-def reactivate_inactive(
-    headers: Dict[str, str],
-    *,
-    scope: str,  # 'companies' | 'contacts' | 'both'
-    dry_run: bool,
+    scope: str,  # "clients" | "contacts" | "both"
+    limit: Optional[int],
     audit: Optional[pathlib.Path],
     audit_detail: bool,
 ) -> None:
-    """
-    Scan for inactive companies/contacts and flip them to active.
-    """
-    total_companies = total_contacts = 0
-    updated_companies = updated_contacts = 0
+    target = limit if (limit is not None and limit >= 0) else None
+    done = 0
 
-    if scope in ("companies", "both"):
-        flt = odata_filter([("active", "eq", 0)])
-        companies = _collect_all_with_filter(
-            headers, "/company.json", entity="clients", flt=flt,
-            audit=audit, audit_detail=audit_detail
-        )
-        total_companies = len(companies)
-        for row in companies:
-            uid = _row_uuid(row)
-            if not uid:
-                continue
-            if _update_active_flag(headers, resource="/company.json", entity="clients",
-                                   uuid=uid, dry_run=dry_run, audit=audit, audit_detail=audit_detail):
-                updated_companies += 1
-        log.info("[REACTIVATE] companies inactive=%d updated=%d",
-                 total_companies, updated_companies)
+    def scan_and_activate(resource: str, entity: str, activator):
+        nonlocal done, target
+        cursor = "-1"
+        while True:
+            if target is not None and done >= target:
+                return
+            params = {"cursor": cursor, "$filter": "active eq 0"}
+            data, resp = sm8_request("GET", resource, headers,
+                                     params=params,
+                                     audit=audit, audit_detail=audit_detail,
+                                     entity=entity, action="scan", key=f"cursor={cursor}")
+            rows = data if isinstance(data, list) else []
+            for row in rows:
+                if target is not None and done >= target:
+                    break
+                uuid = _row_uuid(row)
+                if not uuid:
+                    continue
+                activator(headers, uuid, audit, audit_detail)
+                done += 1
+            if target is not None and done >= target:
+                return
+            nxt = resp.headers.get("x-next-cursor")
+            if not nxt:
+                break
+            cursor = nxt
 
+    if scope in ("clients", "both"):
+        scan_and_activate("/company.json", "clients", _activate_company_uuid)
     if scope in ("contacts", "both"):
-        flt = odata_filter([("active", "eq", 0)])
-        contacts = _collect_all_with_filter(
-            headers, "/companycontact.json", entity="company_contacts", flt=flt,
-            audit=audit, audit_detail=audit_detail
-        )
-        total_contacts = len(contacts)
-        for row in contacts:
-            uid = _row_uuid(row)
-            if not uid:
-                continue
-            if _update_active_flag(headers, resource="/companycontact.json", entity="company_contacts",
-                                   uuid=uid, dry_run=dry_run, audit=audit, audit_detail=audit_detail):
-                updated_contacts += 1
-        log.info("[REACTIVATE] company_contacts inactive=%d updated=%d",
-                 total_contacts, updated_contacts)
+        scan_and_activate("/companycontact.json", "company_contacts", _activate_contact_uuid)
+
+
+def reactivate_from_hcp(
+    headers: Dict[str, str],
+    *,
+    run_dir: pathlib.Path,
+    scope: str,  # "clients" | "contacts" | "both"
+    limit: Optional[int],
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> None:
+    src = run_dir / "customers.ndjson"
+    if not src.exists():
+        log.warning("customers.ndjson not found in %s; nothing to reactivate.", run_dir)
+        return
+
+    target = limit if (limit is not None and limit >= 0) else None
+    activations = 0
+    processed = 0
+
+    for hcp in iter_ndjson(src):
+        if target is not None and activations >= target:
+            break
+
+        processed += 1
+        comp = (hcp.get("company") or "").strip()
+        first = (hcp.get("first_name") or "").strip()
+        last = (hcp.get("last_name") or "").strip()
+        full_name = (f"{first} {last}".strip() or (hcp.get("email") or "").split("@")[0] if hcp.get("email") else "").strip()
+        email = (hcp.get("email") or "").strip()
+
+        # Try to reactivate the individual client (no company) by name
+        tried = False
+        if not comp and full_name:
+            uuid = find_company_by_name(headers, name=full_name, audit=audit, audit_detail=audit_detail)
+            tried = True
+            if uuid:
+                if scope in ("clients", "both"):
+                    _activate_company_uuid(headers, uuid, audit, audit_detail)
+                    activations += 1
+                if scope in ("contacts", "both") and email:
+                    # reactivate matching contact under this company if found by email
+                    flt = odata_filter([("company_uuid", "eq", uuid), ("email", "eq", email)])
+                    data, _ = sm8_request("GET", "/companycontact.json", headers,
+                                          params={"$filter": flt},
+                                          audit=audit, audit_detail=audit_detail,
+                                          entity="company_contacts", action="lookup_row", key=flt)
+                    rows = data if isinstance(data, list) else []
+                    if rows:
+                        c_uuid = _row_uuid(rows[0])
+                        if c_uuid:
+                            _activate_contact_uuid(headers, c_uuid, audit, audit_detail)
+
+        # Optional: if company exists and scope includes clients, try by company name as well
+        if comp and scope in ("clients", "both") and (target is None or activations < target):
+            uuid = find_company_by_name(headers, name=comp, audit=audit, audit_detail=audit_detail)
+            if uuid:
+                _activate_company_uuid(headers, uuid, audit, audit_detail)
+                activations += 1
+
+        if target is not None and activations >= target:
+            break
+
+    log.info("[REACTIVATE] source=hcp scope=%s activations=%s processed_hcp_rows=%s",
+             scope, activations, processed)
 
 # ---------------- Importers ----------------
 
@@ -875,8 +954,7 @@ def import_employees(
 ) -> None:
     src = run_dir / "employees.ndjson"
     if not src.exists():
-        log.warning(
-            "employees.ndjson not found in %s; nothing to import.", run_dir)
+        log.warning("employees.ndjson not found in %s; nothing to import.", run_dir)
         return
 
     log.info("Importing employees from %s", src)
@@ -967,20 +1045,21 @@ def import_customers(
     dry_run: bool,
     limit: Optional[int],
     skip: int,
+    merge_address_mode: str,  # "off" | "missing" | "always"
     audit: Optional[pathlib.Path],
     audit_detail: bool,
 ) -> None:
     """
     Rules:
       - If no company: create/find a single Client (individual), THEN create a BILLING + primary Company Contact.
+        If client existed, optionally merge address per --merge-address.
       - If company present: upsert Company Client (by name), upsert Site by address (parent_company_uuid + address_*),
         upsert Company Contact (dedupe by email OR phone/mobile OR first+last).
       - No heavy preloads: on-demand OData lookups per record.
     """
     src = run_dir / "customers.ndjson"
     if not src.exists():
-        log.warning(
-            "customers.ndjson not found in %s; nothing to import.", run_dir)
+        log.warning("customers.ndjson not found in %s; nothing to import.", run_dir)
         return
 
     log.info("Importing customers from %s", src)
@@ -989,6 +1068,7 @@ def import_customers(
     created_clients = 0
     created_sites = 0
     created_contacts = 0
+    merged_addresses = 0
 
     for hcp in iter_ndjson(src):
         processed += 1
@@ -1000,8 +1080,7 @@ def import_customers(
         comp = (hcp.get("company") or "").strip()
         first = (hcp.get("first_name") or "").strip()
         last = (hcp.get("last_name") or "").strip()
-        full_name = (f"{first} {last}".strip() or (hcp.get("email") or "").split(
-            "@")[0] if hcp.get("email") else "").strip()
+        full_name = (f"{first} {last}".strip() or (hcp.get("email") or "").split("@")[0] if hcp.get("email") else "").strip()
         email = (hcp.get("email") or "").strip()
         phone = hcp.get("home_number") or hcp.get("work_number") or ""
         mobile = hcp.get("mobile_number") or ""
@@ -1012,9 +1091,8 @@ def import_customers(
             client_name = full_name or "Unknown Customer"
 
             # find or create the individual client
-            client_uuid = find_company_by_name(
-                headers, name=client_name, audit=audit, audit_detail=audit_detail
-            )
+            client_uuid = find_company_by_name(headers, name=client_name, audit=audit, audit_detail=audit_detail)
+            created_now = False
             if not client_uuid:
                 client_payload = map_company_payload(
                     name=client_name,
@@ -1026,6 +1104,20 @@ def import_customers(
                     audit=audit, audit_detail=audit_detail
                 )
                 created_clients += 1
+                created_now = True
+
+            # address merge (only for existing individual clients and when we have an address)
+            if not created_now and any(address.values()):
+                merged = maybe_merge_address_into_individual(
+                    headers,
+                    company_uuid=client_uuid,
+                    hcp_address=address,
+                    mode=merge_address_mode,
+                    audit=audit,
+                    audit_detail=audit_detail,
+                )
+                if merged:
+                    merged_addresses += 1
 
             # create/dedupe the BILLING + primary contact for the individual
             contact_uuid = find_contact(
@@ -1052,8 +1144,7 @@ def import_customers(
             name=comp,
             is_individual=False
         )
-        parent_uuid = find_company_by_name(
-            headers, name=company_payload["name"], audit=audit, audit_detail=audit_detail)
+        parent_uuid = find_company_by_name(headers, name=company_payload["name"], audit=audit, audit_detail=audit_detail)
         if not parent_uuid:
             parent_uuid = create_company(
                 headers, payload=company_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
@@ -1088,25 +1179,22 @@ def import_customers(
             if contact_uuid:
                 created_contacts += 1
 
-    log.info("[SUMMARY] customers processed=%d created_clients=%d created_sites=%d created_contacts=%d",
-             processed, created_clients, created_sites, created_contacts)
+    log.info("[SUMMARY] customers processed=%d created_clients=%d created_sites=%d "
+             "created_contacts=%d merged_addresses=%d",
+             processed, created_clients, created_sites, created_contacts, merged_addresses)
 
 # ---------------- CLI ----------------
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Import Housecall Pro NDJSON into ServiceM8, dump Clients/Contacts, or reactivate inactive records")
+        description="Import Housecall Pro NDJSON into ServiceM8, dump, reactivate, and optionally merge addresses for existing clients")
 
     # Logging controls
-    ap.add_argument("--quiet", action="store_true",
-                    help="Hide INFO logs (only warnings & errors)")
-    ap.add_argument("--silent", action="store_true",
-                    help="Hide almost all logging (critical only)")
-    ap.add_argument(
-        "--log-file", help="Write logs to this file instead of console")
-    ap.add_argument("--no-console", action="store_true",
-                    help="Disable terminal logging entirely")
+    ap.add_argument("--quiet", action="store_true", help="Hide INFO logs (only warnings & errors)")
+    ap.add_argument("--silent", action="store_true", help="Hide almost all logging (critical only)")
+    ap.add_argument("--log-file", help="Write logs to this file instead of console")
+    ap.add_argument("--no-console", action="store_true", help="Disable terminal logging entirely")
 
     # Rate limiting
     ap.add_argument("--rpm", type=int, default=DEFAULT_RPM,
@@ -1115,40 +1203,38 @@ def main() -> None:
     # Dump mode
     ap.add_argument("--dump-all", action="store_true",
                     help="Fetch all Clients and Company Contacts to a single JSON file and exit")
-    ap.add_argument(
-        "--dump-file", help="Where to write the dump JSON (a timestamped copy will be created). Default: ./sm8_export/")
+    ap.add_argument("--dump-file",
+                    help="Where to write the dump JSON (a timestamped copy will be created). Default: ./sm8_export/")
 
     # Reactivation mode
-    ap.add_argument("--activate-inactive", choices=["companies", "contacts", "both"],
-                    help="Scan for inactive records and set active=1 (updates only).")
+    ap.add_argument("--activate-inactive", choices=["off", "clients", "contacts", "both"], default="off",
+                    help="Reactivate inactive items (default: off)")
+    ap.add_argument("--reactivate-from", choices=["live", "hcp"],
+                    help="When reactivating: 'live' scans SM8 inactive; 'hcp' matches names from your HCP export")
 
     # Import mode
-    ap.add_argument(
-        "--ndjson-dir", help="Path to NDJSON run dir (or base dir when used with --latest). Default ./hcp_export")
+    ap.add_argument("--ndjson-dir",
+                    help="Path to NDJSON run dir (or base dir when used with --latest). Default ./hcp_export")
     ap.add_argument("--latest", action="store_true",
                     help="Pick newest timestamped subfolder under --ndjson-dir (or ./hcp_export)")
-    ap.add_argument("--only", choices=["employees", "customers"],
-                    default="employees", help="Entity to import")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Print actions but do not POST")
-    ap.add_argument("--limit", type=int,
-                    help="Import at most N records (per entity)")
-    ap.add_argument("--skip", type=int, default=0,
-                    help="Skip the first N source records")
-    ap.add_argument(
-        "--dotenv", help="Path to .env file to load (otherwise auto-discovered)")
-    ap.add_argument("--auth-mode", choices=["oauth", "apikey"],
-                    help="Force auth mode (otherwise auto-detect)")
-    ap.add_argument(
-        "--audit-file", help="Write NDJSON audit lines to a new timestamped file based on this path")
+    ap.add_argument("--only", choices=["employees", "customers"], default="employees", help="Entity to import")
+    ap.add_argument("--dry-run", action="store_true", help="Print actions but do not POST")
+    ap.add_argument("--limit", type=int, help="Import at most N records (per entity) OR max activations for reactivate")
+    ap.add_argument("--skip", type=int, default=0, help="Skip the first N source records")
+    ap.add_argument("--dotenv", help="Path to .env file to load (otherwise auto-discovered)")
+    ap.add_argument("--auth-mode", choices=["oauth", "apikey"], help="Force auth mode (otherwise auto-detect)")
+    ap.add_argument("--audit-file", help="Write NDJSON audit lines to a new timestamped file based on this path")
     ap.add_argument("--audit-detail", action="store_true",
                     help="Include response previews and key headers in audit lines")
+
+    # Address merge behavior for existing individual clients
+    ap.add_argument("--merge-address", choices=["off", "missing", "always"], default="missing",
+                    help="For existing individual clients, fill address from HCP (missing) or overwrite (always)")
 
     args = ap.parse_args()
 
     # Configure logging early
-    setup_logging(quiet=args.quiet, silent=args.silent,
-                  log_file=args.log_file, no_console=args.no_console)
+    setup_logging(quiet=args.quiet, silent=args.silent, log_file=args.log_file, no_console=args.no_console)
 
     # Rate limit parameter
     global _GLOBAL_RPM
@@ -1166,33 +1252,32 @@ def main() -> None:
     headers, _mode = build_auth(headers, args.auth_mode)
 
     # Audit setup (roll a new file each run if provided)
-    audit_base = pathlib.Path(
-        args.audit_file).resolve() if args.audit_file else None
-    audit_path = _roll_timestamped_file(
-        audit_base, label="Audit file")  # may be None
+    audit_base = pathlib.Path(args.audit_file).resolve() if args.audit_file else None
+    audit_path = _roll_timestamped_file(audit_base, label="Audit file")  # may be None
 
-    # REACTIVATION MODE
-    if args.activate_inactive:
-        reactivate_inactive(
-            headers,
-            scope=args.activate_inactive,
-            dry_run=args.dry_run,
-            audit=audit_path,
-            audit_detail=args.audit_detail,
-        )
+    # REACTIVATION MODE (early exit)
+    if args.activate_inactive != "off":
+        if args.reactivate_from == "hcp":
+            # Need run dir to read customers.ndjson
+            run_dir = resolve_ndjson_dir(args.ndjson_dir, args.latest)
+            log.info("HCP reactivation using NDJSON dir: %s", run_dir)
+            reactivate_from_hcp(headers, run_dir=run_dir, scope=args.activate_inactive,
+                                limit=args.limit, audit=audit_path, audit_detail=args.audit_detail)
+        else:
+            # live scan (no NDJSON needed)
+            reactivate_from_live(headers, scope=args.activate_inactive,
+                                 limit=args.limit, audit=audit_path, audit_detail=args.audit_detail)
         return
 
     # DUMP MODE
     if args.dump_all:
-        dump_base = pathlib.Path(args.dump_file).resolve(
-        ) if args.dump_file else pathlib.Path("./sm8_export/").resolve()
-        dump_path = _roll_timestamped_file(
-            dump_base, label="Dump file", default_suffix=".json", default_name="clients_contacts"
-        )
+        # Default to a directory, but create a file IN it: clients_contacts.json
+        dump_base = pathlib.Path(args.dump_file).resolve() if args.dump_file else pathlib.Path("./sm8_export/").resolve()
+        dump_path = _roll_timestamped_file(dump_base, label="Dump file", default_suffix=".json",
+                                           default_name="clients_contacts")
         if dump_path is None:
             sys.exit("Internal error: dump file path could not be resolved.")
-        dump_clients_and_contacts(
-            headers, out_path=dump_path, audit=audit_path, audit_detail=args.audit_detail)
+        dump_clients_and_contacts(headers, out_path=dump_path, audit=audit_path, audit_detail=args.audit_detail)
         return
 
     # IMPORT MODE
@@ -1214,6 +1299,7 @@ def main() -> None:
         import_customers(
             run_dir, headers,
             dry_run=args.dry_run, limit=args.limit, skip=args.skip,
+            merge_address_mode=args.merge_address,
             audit=audit_path, audit_detail=args.audit_detail,
         )
     else:
