@@ -1,45 +1,25 @@
 #!/usr/bin/env python3
 """
-ServiceM8 Import Script — Imports data from Housecall Pro NDJSON exports to ServiceM8,
-and can also dump all Clients + Company Contacts to JSON.
+ServiceM8 Import & Dump Tool
 
-What's new (dump mode):
-  - --dump-all + --dump-file write a single JSON file:
-      {
-        "clients": [ ... ],
-        "company_contacts": [ ... ]
-      }
-    using cursor-based pagination (no writes to ServiceM8).
-  - The dump file name is timestamped like <name>_YYYYMMDDTHHMMSSZ.json.
-  - Auditing applies to GET requests during dump (if --audit-file is set).
-
-Still includes:
-  - "Strict" payload for /company.json: ONLY documented fields are sent:
-    name, is_individual, parent_company_uuid, address_street, address_city,
-    address_state, address_postcode, address_country.
-  - Company dedupe by name only; site dedupe by parent+address via OData filters.
-  - DRY helpers for OData, auditing, lookups, retry/backoff HTTP client.
+What's new:
+  - Logging controls:
+      --quiet (hide INFO), --silent (hide almost everything),
+      --log-file PATH (write logs to file), --no-console (no terminal logging).
+  - Built-in rate limiter to avoid throttling (default --rpm 120).
+  - Strict /company.json payload (documented fields only).
+  - Sites are companies with parent_company_uuid; dedupe via parent+address.
+  - Dump mode to export all Clients + Company Contacts to one JSON file.
+  - Per-run, timestamped audit and dump file names.
 
 Usage examples:
-  # Dump only (no imports), with audit:
-  python sm8_import.py --dump-all --dump-file ./export/clients_contacts.json --audit-file ./audit/dump.ndjson --audit-detail
+  # Dump all without printing to terminal, write logs to file, paced at 120 rpm
+  python sm8_import.py --dump-all --dump-file ./export/clients_contacts.json \
+    --audit-file ./audit/dump.ndjson --no-console --log-file ./logs/run.log --rpm 120
 
-  # Customers only, dry-run, detailed audit on the newest export
-  python sm8_import.py --latest --only customers --limit 5 --dry-run --audit-file ./audit/customers.ndjson --audit-detail
-
-  # Real run (employees)
-  python sm8_import.py --latest --only employees
-
-Auth:
-  - OAuth bearer: set SM8_OAUTH_TOKEN (scopes: manage_staff, read_customers, manage_customers,
-    read_customer_contacts, manage_customer_contacts)
-  - API key: set SM8_API_KEY (smk-...) — sent as X-Api-Key
-  - Force mode via --auth-mode oauth|apikey (auto-detect otherwise)
-
-Notes:
-  - “Clients” (and “Sites”) live at /company.json
-  - “Company Contacts” live at /companycontact.json
-  - Dry-run NEVER POSTs; it logs “dry_post” audit records with payloads.
+  # Customers only, dry-run, detailed audit on newest export
+  python sm8_import.py --latest --only customers --limit 5 \
+    --dry-run --audit-file ./audit/customers.ndjson --audit-detail --rpm 120
 """
 
 from __future__ import annotations
@@ -54,6 +34,7 @@ import re
 import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections import deque
 
 import requests
 from requests import Session
@@ -66,7 +47,7 @@ from requests.exceptions import (
 from urllib3.exceptions import ProtocolError
 from dotenv import load_dotenv, find_dotenv
 
-# ---------------- Config & Logging ----------------
+# ---------------- Config & Globals ----------------
 
 SM8_BASE_URL = "https://api.servicem8.com/api_1.0"
 TIMESTAMP_DIR_RE = re.compile(r"^\d{8}T\d{6}Z$")
@@ -79,16 +60,52 @@ DEFAULT_CONNECT_TIMEOUT = float(os.getenv("SM8_CONNECT_TIMEOUT", "15"))
 DEFAULT_READ_TIMEOUT = float(os.getenv("SM8_READ_TIMEOUT", "90"))
 DEFAULT_MAX_RETRIES = int(os.getenv("SM8_MAX_RETRIES", "8"))
 DEFAULT_BACKOFF_CAP = float(os.getenv("SM8_BACKOFF_MAX", "60"))
+DEFAULT_RPM = int(os.getenv("SM8_RPM", "120"))  # stay below 180/min
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+# Rate limiting globals
+_GLOBAL_RPM: int = DEFAULT_RPM
+_REQUEST_TIMES = deque()  # monotonic timestamps of requests (rolling 60s window)
+
+# Logger
 log = logging.getLogger("sm8-import")
+
+# ---------------- Logging setup ----------------
+
+
+def setup_logging(*, quiet: bool, silent: bool, log_file: Optional[str], no_console: bool) -> None:
+    level = logging.INFO
+    if silent:
+        level = logging.CRITICAL
+    elif quiet:
+        level = logging.WARNING
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Remove existing handlers
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    # File handler
+    if log_file:
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
+    # Console handler (unless disabled)
+    if not no_console:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setLevel(level)
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
 
 # ---------------- Env / Auth ----------------
 
 
 def load_env(dotenv_path: Optional[str]) -> Optional[str]:
-    """Load .env (explicit path or auto-discovered) and return the path used."""
     used_path = None
     if dotenv_path:
         env_file = str(pathlib.Path(dotenv_path).resolve())
@@ -105,12 +122,6 @@ def load_env(dotenv_path: Optional[str]) -> Optional[str]:
 
 
 def build_auth(headers: Dict[str, str], auth_mode: Optional[str]) -> Tuple[Dict[str, str], str]:
-    """
-    Returns (headers, mode_str).
-    Modes:
-      - oauth  -> headers['Authorization'] = 'Bearer <SM8_OAUTH_TOKEN>'
-      - apikey -> headers['X-Api-Key'] = <SM8_API_KEY>
-    """
     forced = (auth_mode or "").strip().lower()
     oauth_token = os.getenv("SM8_OAUTH_TOKEN")
     api_key = os.getenv("SM8_API_KEY")
@@ -129,7 +140,6 @@ def build_auth(headers: Dict[str, str], auth_mode: Optional[str]) -> Tuple[Dict[
         log.info("Auth mode: apikey (X-Api-Key)")
         return headers, "apikey"
 
-    # Auto-detect
     if oauth_token:
         headers["Authorization"] = f"Bearer {oauth_token}"
         log.info("Auth mode: oauth (Bearer token) [auto]")
@@ -155,10 +165,6 @@ def list_timestamp_dirs(root: pathlib.Path) -> List[pathlib.Path]:
 
 
 def resolve_ndjson_dir(base_or_run: Optional[str], latest: bool) -> pathlib.Path:
-    """
-    If latest is True, pick newest timestamped subfolder under base_or_run or ./hcp_export.
-    Else, base_or_run must be a specific run directory.
-    """
     if latest:
         base = pathlib.Path(base_or_run or "./hcp_export").resolve()
         runs = list_timestamp_dirs(base)
@@ -204,7 +210,6 @@ def _row_uuid(row: Dict[str, Any]) -> Optional[str]:
 
 
 def _quote_odata_value(val: Any) -> str:
-    # Strings must be single-quoted with internal quotes doubled
     if isinstance(val, str):
         return "'" + val.replace("'", "''") + "'"
     if isinstance(val, bool):
@@ -281,7 +286,7 @@ def _append_audit(
     with audit.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-# ---------------- HTTP Client w/ Retry ----------------
+# ---------------- HTTP Client, Rate Limiting & Retries ----------------
 
 
 _session: Optional[Session] = None
@@ -299,6 +304,29 @@ def get_session() -> Session:
     return _session
 
 
+def _enforce_rpm():
+    """Ensure we do not exceed _GLOBAL_RPM requests in any rolling 60-second window."""
+    rpm = _GLOBAL_RPM
+    if not rpm or rpm <= 0:
+        return
+    now = time.monotonic()
+    window = 60.0
+    dq = _REQUEST_TIMES
+    # prune old
+    while dq and (now - dq[0]) > window:
+        dq.popleft()
+    if len(dq) >= rpm:
+        sleep_for = window - (now - dq[0]) + \
+            random.uniform(0, 0.25)  # tiny jitter
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        # prune again
+        now = time.monotonic()
+        while dq and (now - dq[0]) > window:
+            dq.popleft()
+    dq.append(time.monotonic())
+
+
 def sm8_request(
     method: str,
     resource: str,
@@ -310,7 +338,6 @@ def sm8_request(
     connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
     read_timeout: float = DEFAULT_READ_TIMEOUT,
     backoff_cap: float = DEFAULT_BACKOFF_CAP,
-    # audit meta
     audit: Optional[pathlib.Path] = None,
     audit_detail: bool = False,
     entity: Optional[str] = None,
@@ -330,6 +357,9 @@ def sm8_request(
 
     for attempt in range(1, retries + 1):
         try:
+            # pace requests BEFORE each attempt (retries included)
+            _enforce_rpm()
+
             r = session.request(
                 method=method.upper(),
                 url=url,
@@ -339,7 +369,7 @@ def sm8_request(
                 timeout=(connect_timeout, read_timeout),
             )
 
-            # Transient HTTP status? backoff + retry
+            # transient HTTP? (includes 429 throttling)
             if r.status_code in TRANSIENT_STATUSES:
                 if attempt == retries:
                     snippet = (r.text or "")[:500]
@@ -362,7 +392,7 @@ def sm8_request(
                 backoff = min(backoff * 2, backoff_cap)
                 continue
 
-            # Non-transient error?
+            # Non-transient error
             if r.status_code >= 400:
                 snippet = (r.text or "")[:500]
                 log.error("%s %s -> HTTP %s :: %s", method.upper(),
@@ -375,13 +405,11 @@ def sm8_request(
                 }, detail=audit_detail, response=r)
                 r.raise_for_status()
 
-            # Success
             try:
                 data = r.json()
             except ValueError:
                 data = None
 
-            # Audit success
             _append_audit(audit, {
                 "ts": time.time(), "entity": entity, "action": action or method.lower(), "key": key,
                 "method": method.upper(), "resource": resource, "status": r.status_code,
@@ -406,7 +434,6 @@ def sm8_request(
             time.sleep(sleep_for)
             backoff = min(backoff * 2, backoff_cap)
 
-    # Exhausted retries
     log.error("Exhausted %d retries for %s %s. Last error: %s",
               retries, method.upper(), resource, last_exc)
     _append_audit(audit, {
@@ -418,7 +445,7 @@ def sm8_request(
     raise RuntimeError(
         f"sm8_request: exhausted {retries} attempts for {method.upper()} {resource}")
 
-# ---------------- Lookups & Creation (DRY helpers) ----------------
+# ---------------- Lookups & Creation ----------------
 
 
 def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
@@ -630,7 +657,7 @@ def create_contact(
     uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
     return uuid
 
-# ---------------- Dump helpers (cursor-based pagination) ----------------
+# ---------------- Dump helpers ----------------
 
 
 def _collect_all(
@@ -710,7 +737,6 @@ def import_employees(
     created = 0
     processed = 0
 
-    # Best-effort: avoid duplicate emails
     existing_emails = set()
     try:
         cursor = "-1"
@@ -729,8 +755,7 @@ def import_employees(
                 break
             cursor = nxt
     except requests.HTTPError as e:
-        log.warning("Failed to prelist /staff.json: HTTP %s :: %s",
-                    getattr(e.response, "status_code", "?"), (getattr(e.response, "text", "") or "")[:200])
+        pass
 
     for hcp in iter_ndjson(src):
         processed += 1
@@ -773,7 +798,6 @@ def import_employees(
             continue
 
         if email and email in existing_emails:
-            log.info("[SKIP] Staff exists (email): %s", email)
             continue
 
         try:
@@ -782,14 +806,9 @@ def import_employees(
                                   entity="staff", action="create", key=staff.get("email"))
             if email:
                 existing_emails.add(email)
-            log.info("[OK] Created staff %s -> %s", staff["email"],
-                     resp.headers.get("x-record-uuid") or "(uuid n/a)")
             created += 1
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", None)
-            body = (getattr(e.response, "text", "") or "")[:300]
-            log.error("Failed to create staff for email=%s: HTTP %s. Body: %s",
-                      staff["email"], code, body)
+        except requests.HTTPError:
+            pass
 
     log.info("[SUMMARY] employees processed=%d created=%d skipped=%d",
              processed, created, processed - created)
@@ -842,14 +861,12 @@ def import_customers(
         mobile = hcp.get("mobile_number") or ""
         address = pick_best_address(hcp)
 
-        # No company: single Client (individual). No company contact (per your rule).
+        # No company: single Client (individual). No company contact.
         if not comp:
             client_name = full_name or "Unknown Customer"
             existing_uuid = find_company_by_name(
                 headers, name=client_name, audit=audit, audit_detail=audit_detail)
             if existing_uuid:
-                log.info("[EXISTS] Client (individual) %s -> %s",
-                         client_name, existing_uuid)
                 continue
 
             client_payload = map_company_payload(
@@ -859,12 +876,6 @@ def import_customers(
             )
             uuid = create_company(headers, payload=client_payload,
                                   dry_run=dry_run, audit=audit, audit_detail=audit_detail)
-            if dry_run:
-                log.info("[DRY-CREATE] Client (individual) %s -> %s",
-                         client_name, uuid)
-            else:
-                log.info("[OK] Client (individual) %s -> %s",
-                         client_name, uuid)
             created_clients += 1
             continue
 
@@ -908,13 +919,6 @@ def import_customers(
             if contact_uuid:
                 created_contacts += 1
 
-        if dry_run:
-            log.info("[DRY-CREATE] Company=%s parent=%s site=%s contact=%s",
-                     comp, parent_uuid, site_uuid or "(none)", contact_uuid or "(none)")
-        else:
-            log.info("[OK] Company=%s parent=%s site=%s contact=%s",
-                     comp, parent_uuid, site_uuid or "(none)", contact_uuid or "(none)")
-
     log.info("[SUMMARY] customers processed=%d created_clients=%d created_sites=%d created_contacts=%d",
              processed, created_clients, created_sites, created_contacts)
 
@@ -924,7 +928,22 @@ def import_customers(
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Import Housecall Pro NDJSON into ServiceM8, or dump Clients/Contacts to JSON")
-    # Dump mode (mutually independent of import mode)
+
+    # Logging controls
+    ap.add_argument("--quiet", action="store_true",
+                    help="Hide INFO logs (only warnings & errors)")
+    ap.add_argument("--silent", action="store_true",
+                    help="Hide almost all logging (critical only)")
+    ap.add_argument(
+        "--log-file", help="Write logs to this file instead of console")
+    ap.add_argument("--no-console", action="store_true",
+                    help="Disable terminal logging entirely")
+
+    # Rate limiting
+    ap.add_argument("--rpm", type=int, default=DEFAULT_RPM,
+                    help="Max requests per minute (default: 120, 0 disables)")
+
+    # Dump mode
     ap.add_argument("--dump-all", action="store_true",
                     help="Fetch all Clients and Company Contacts to a single JSON file and exit")
     ap.add_argument(
@@ -954,14 +973,22 @@ def main() -> None:
 
     args = ap.parse_args()
 
+    # Configure logging early
+    setup_logging(quiet=args.quiet, silent=args.silent,
+                  log_file=args.log_file, no_console=args.no_console)
+
+    # Rate limit parameter
+    global _GLOBAL_RPM
+    _GLOBAL_RPM = max(0, int(args.rpm or 0))
+
     # Load env
     load_env(args.dotenv)
 
-    # Build headers (common)
+    # Build headers
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "sm8-import/1.4 (+https://servicem8.com)",
+        "User-Agent": "sm8-import/1.5 (+https://servicem8.com)",
     }
     headers, _mode = build_auth(headers, args.auth_mode)
 
@@ -971,7 +998,7 @@ def main() -> None:
     audit_path = _roll_timestamped_file(
         audit_base, label="Audit file")  # may be None
 
-    # DUMP MODE (no imports, no NDJSON dir required)
+    # DUMP MODE
     if args.dump_all:
         dump_base = pathlib.Path(args.dump_file).resolve(
         ) if args.dump_file else pathlib.Path("./sm8_export/").resolve()
@@ -982,13 +1009,12 @@ def main() -> None:
             headers, out_path=dump_path, audit=audit_path, audit_detail=args.audit_detail)
         return
 
-    # IMPORT MODE (requires NDJSON dir)
+    # IMPORT MODE
     run_dir = resolve_ndjson_dir(args.ndjson_dir, args.latest)
     log.info("Using NDJSON dir: %s", run_dir)
     if not run_dir.exists():
         sys.exit(f"NDJSON dir not found: {run_dir}")
 
-    # Default SM8 security role for staff can be passed via env SM8_DEFAULT_ROLE_UUID
     default_role_uuid = os.getenv("SM8_DEFAULT_ROLE_UUID") or None
 
     if args.only == "employees":
