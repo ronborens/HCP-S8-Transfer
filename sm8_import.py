@@ -235,20 +235,27 @@ def odata_filter(conditions: List[Tuple[str, str, Any]]) -> str:
 # ---------------- Auditing & Timestamped files ----------------
 
 
-def _roll_timestamped_file(base_path: Optional[pathlib.Path], *, label: str) -> Optional[pathlib.Path]:
+def _roll_timestamped_file(base_path: Optional[pathlib.Path], *, label: str,
+                           default_suffix: str = ".ndjson", default_name: str = "file") -> Optional[pathlib.Path]:
     """
-    Given a base path (e.g., ./audit/customers.ndjson or ./export/clients_contacts.json),
-    create a sibling file with a UTC timestamp suffix: <stem>_YYYYMMDDTHHMMSSZ<suffix>
-    Returns the rolled path or None if base_path is None.
+    If base_path is a directory or path without an extension, append default_name+default_suffix inside it.
+    Otherwise, treat base_path as a file path and roll <stem>_YYYYMMDDTHHMMSSZ<suffix>.
     """
     if not base_path:
         return None
-    base_path = base_path.resolve()
-    base_path.parent.mkdir(parents=True, exist_ok=True)
-    stem = base_path.stem
-    suffix = base_path.suffix or ".ndjson"
+
+    p = base_path.resolve()
+
+    # If user gave a directory (or path lacking a suffix), write inside that dir with a default filename.
+    if p.is_dir() or p.suffix == "" or str(base_path).endswith(("/", "\\")):
+        p = p / f"{default_name}{default_suffix}"
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    stem = p.stem
+    suffix = p.suffix or default_suffix
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    rolled = base_path.with_name(f"{stem}_{ts}{suffix}")
+    rolled = p.with_name(f"{stem}_{ts}{suffix}")
     rolled.touch()
     log.info("%s: %s", label, rolled)
     return rolled
@@ -947,7 +954,7 @@ def main() -> None:
     ap.add_argument("--dump-all", action="store_true",
                     help="Fetch all Clients and Company Contacts to a single JSON file and exit")
     ap.add_argument(
-        "--dump-file", help="Where to write the dump JSON (a timestamped copy will be created). Default: ./export/clients_contacts.json")
+        "--dump-file", help="Where to write the dump JSON (a timestamped copy will be created). Default: ./sm8_export/")
 
     # Import mode
     ap.add_argument(
@@ -998,11 +1005,15 @@ def main() -> None:
     audit_path = _roll_timestamped_file(
         audit_base, label="Audit file")  # may be None
 
+
     # DUMP MODE
     if args.dump_all:
+        # Default to a directory, but create a file IN it: clients_contacts.json
         dump_base = pathlib.Path(args.dump_file).resolve(
         ) if args.dump_file else pathlib.Path("./sm8_export/").resolve()
-        dump_path = _roll_timestamped_file(dump_base, label="Dump file")
+        dump_path = _roll_timestamped_file(
+            dump_base, label="Dump file", default_suffix=".json", default_name="clients_contacts"
+        )
         if dump_path is None:
             sys.exit("Internal error: dump file path could not be resolved.")
         dump_clients_and_contacts(
