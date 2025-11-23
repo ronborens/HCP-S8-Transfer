@@ -475,8 +475,13 @@ def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
     service = next((a for a in addrs if (a.get("type") or "").lower() == "service"), None)
     billing = next((a for a in addrs if (a.get("type") or "").lower() == "billing"), None)
     a = service or billing or {}
+    
+    s1 = a.get("street") or a.get("street_line_1") or ""
+    s2 = a.get("street_line_2") or ""
+    street = f"{s1}\n{s2}".strip() if s2 else s1
+
     return {
-        "street": a.get("street") or a.get("street_line_1") or "",
+        "street": street,
         "city": a.get("city") or "",
         "state": a.get("state") or "",
         "zip": a.get("zip") or a.get("postcode") or "",
@@ -517,8 +522,13 @@ def map_contact_payload(
     first = (hcp_customer.get("first_name") or "").strip()
     last = (hcp_customer.get("last_name") or "").strip()
     email = (hcp_customer.get("email") or "").strip()
-    phone = hcp_customer.get("home_number") or hcp_customer.get("work_number") or ""
-    mobile = hcp_customer.get("mobile_number") or ""
+    
+    raw_phone = hcp_customer.get("home_number") or hcp_customer.get("work_number")
+    phone = norm_phone(raw_phone)
+    
+    raw_mobile = hcp_customer.get("mobile_number")
+    mobile = norm_phone(raw_mobile)
+
     obj = {
         "company_uuid": company_uuid,
         "first": first or None,
@@ -900,7 +910,7 @@ def reactivate_from_hcp(
         comp = (hcp.get("company") or "").strip()
         first = (hcp.get("first_name") or "").strip()
         last = (hcp.get("last_name") or "").strip()
-        full_name = (f"{first} {last}".strip() or (hcp.get("email") or "").split("@")[0] if hcp.get("email") else "").strip()
+        full_name = get_full_name(hcp)
         email = (hcp.get("email") or "").strip()
 
         # Try to reactivate the individual client (no company) by name
@@ -939,6 +949,17 @@ def reactivate_from_hcp(
              scope, activations, processed)
 
 # ---------------- Importers ----------------
+
+
+def get_full_name(hcp: Dict[str, Any]) -> str:
+    first = (hcp.get("first_name") or "").strip()
+    last = (hcp.get("last_name") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
+    email = (hcp.get("email") or "").strip()
+    if email:
+        return email.split("@")[0]
+    return ""
 
 
 def import_employees(
@@ -1070,6 +1091,10 @@ def import_customers(
     created_contacts = 0
     merged_addresses = 0
 
+    # Cache for company UUIDs to avoid repeated lookups
+    # Key: company name (or individual name) -> Value: UUID
+    company_cache: Dict[str, str] = {}
+
     for hcp in iter_ndjson(src):
         processed += 1
         if processed <= max(skip, 0):
@@ -1080,10 +1105,13 @@ def import_customers(
         comp = (hcp.get("company") or "").strip()
         first = (hcp.get("first_name") or "").strip()
         last = (hcp.get("last_name") or "").strip()
-        full_name = (f"{first} {last}".strip() or (hcp.get("email") or "").split("@")[0] if hcp.get("email") else "").strip()
+        full_name = get_full_name(hcp)
         email = (hcp.get("email") or "").strip()
-        phone = hcp.get("home_number") or hcp.get("work_number") or ""
-        mobile = hcp.get("mobile_number") or ""
+        
+        # Normalize phones for lookup to match storage format
+        phone = norm_phone(hcp.get("home_number") or hcp.get("work_number"))
+        mobile = norm_phone(hcp.get("mobile_number"))
+        
         address = pick_best_address(hcp)
 
         # No company: single Client (individual) + create a BILLING primary contact
@@ -1091,7 +1119,13 @@ def import_customers(
             client_name = full_name or "Unknown Customer"
 
             # find or create the individual client
-            client_uuid = find_company_by_name(headers, name=client_name, audit=audit, audit_detail=audit_detail)
+            if client_name in company_cache:
+                client_uuid = company_cache[client_name]
+            else:
+                client_uuid = find_company_by_name(headers, name=client_name, audit=audit, audit_detail=audit_detail)
+                if client_uuid:
+                    company_cache[client_name] = client_uuid
+
             created_now = False
             if not client_uuid:
                 client_payload = map_company_payload(
@@ -1105,6 +1139,8 @@ def import_customers(
                 )
                 created_clients += 1
                 created_now = True
+                if client_uuid:
+                    company_cache[client_name] = client_uuid
 
             # address merge (only for existing individual clients and when we have an address)
             if not created_now and any(address.values()):
@@ -1140,15 +1176,23 @@ def import_customers(
             continue
 
         # Company client (head office)
-        company_payload = map_company_payload(
-            name=comp,
-            is_individual=False
-        )
-        parent_uuid = find_company_by_name(headers, name=company_payload["name"], audit=audit, audit_detail=audit_detail)
+        if comp in company_cache:
+            parent_uuid = company_cache[comp]
+        else:
+            parent_uuid = find_company_by_name(headers, name=comp, audit=audit, audit_detail=audit_detail)
+            if parent_uuid:
+                company_cache[comp] = parent_uuid
+
         if not parent_uuid:
+            company_payload = map_company_payload(
+                name=comp,
+                is_individual=False
+            )
             parent_uuid = create_company(
                 headers, payload=company_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
             created_clients += 1
+            if parent_uuid:
+                company_cache[comp] = parent_uuid
 
         # Site (by address) — dedupe on parent + address fields
         site_uuid: Optional[str] = None
