@@ -633,8 +633,12 @@ def expand_child_collection(
     # Output prep for single-object children
     nd_path: Optional[pathlib.Path] = None
     raw_dir_single: Optional[pathlib.Path] = None
+    single_obj_file = None
+
     if single_object:
         nd_path = outdir / f"{child_name}.ndjson"
+        # Open file once for all parents to avoid open/close overhead
+        single_obj_file = nd_path.open("a", encoding="utf-8")
         if raw_json:
             raw_dir_single = outdir / "raw" / child_name
             ensure_dir(raw_dir_single)
@@ -644,159 +648,171 @@ def expand_child_collection(
     fast_forward_archived = os.getenv(
         "HCP_ARCHIVED_JOB_FAST_FORWARD", "1") != "0"
 
-    for it in parents:
-        if id_field not in it:
-            continue
-        parent_id = it[id_field]
-        call_params = substitute_params(child_def.get("params", {}), it)
-        path = child_def["path"].replace("{id}", str(parent_id))
-        url = f"{base_url}{path}"
+    try:
+        for it in parents:
+            if id_field not in it:
+                continue
+            parent_id = it[id_field]
+            call_params = substitute_params(child_def.get("params", {}), it)
+            path = child_def["path"].replace("{id}", str(parent_id))
+            url = f"{base_url}{path}"
 
-        if single_object:
-            # One GET per parent; never let HTTPError bubble out.
-            payload, status = classify_single_child_fetch(
-                session_headers, url, call_params, skip_substrings=skip_substrings
-            )
+            if single_object:
+                # One GET per parent; never let HTTPError bubble out.
+                payload, status = classify_single_child_fetch(
+                    session_headers, url, call_params, skip_substrings=skip_substrings
+                )
 
-            if status == "archived" and listing_name == "jobs":
-                if fast_forward_archived:
+                if status == "archived" and listing_name == "jobs":
+                    if fast_forward_archived:
+                        print(
+                            f"[FAST-FWD] {child_name}: archived job at parent {parent_id}; skipping remaining parents for this child.")
+                        if summary_tracker is not None:
+                            summary_tracker.setdefault(
+                                "fast_forwarded_due_to_archived", {}).setdefault(child_name, 0)
+                            summary_tracker["fast_forwarded_due_to_archived"][child_name] += 1
+                        break  # stop this child entirely
+                    else:
+                        print(
+                            f"[WARN] {child_name}: archived job for parent {parent_id}; skipping this parent.")
+                        if summary_tracker is not None:
+                            summary_tracker.setdefault(
+                                "child_skips", {}).setdefault(child_name, 0)
+                            summary_tracker["child_skips"][child_name] += 1
+                        continue
+
+                if status == "skip":
                     print(
-                        f"[FAST-FWD] {child_name}: archived job at parent {parent_id}; skipping remaining parents for this child.")
-                    if summary_tracker is not None:
-                        summary_tracker.setdefault(
-                            "fast_forwarded_due_to_archived", {}).setdefault(child_name, 0)
-                        summary_tracker["fast_forwarded_due_to_archived"][child_name] += 1
-                    break  # stop this child entirely
-                else:
-                    print(
-                        f"[WARN] {child_name}: archived job for parent {parent_id}; skipping this parent.")
+                        f"[WARN] Skipping {child_name} for parent {parent_id} (not found or matched skip policy).")
                     if summary_tracker is not None:
                         summary_tracker.setdefault(
                             "child_skips", {}).setdefault(child_name, 0)
                         summary_tracker["child_skips"][child_name] += 1
                     continue
 
-            if status == "skip":
-                print(
-                    f"[WARN] Skipping {child_name} for parent {parent_id} (not found or matched skip policy).")
-                if summary_tracker is not None:
-                    summary_tracker.setdefault(
-                        "child_skips", {}).setdefault(child_name, 0)
-                    summary_tracker["child_skips"][child_name] += 1
+                # Success: write
+                if raw_json and raw_dir_single:
+                    (raw_dir_single / f"{parent_id}.json").write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                
+                # Write directly to the open file handle
+                if single_obj_file:
+                    items, _ = extract_items(payload, container_key)
+                    if isinstance(items, list) and items:
+                        for row in items:
+                            single_obj_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    elif isinstance(payload, dict) and payload:
+                        single_obj_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                
                 continue
 
-            # Success: write
-            if raw_json and raw_dir_single:
-                (raw_dir_single / f"{parent_id}.json").write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            # Collection child (paginated), possibly with hydration
+            hydrate = child_def.get("hydrate")
+            if not hydrate:
+                parent_suffix = f"{listing_name}_{parent_id}"
+                pages = paginate_collect(
+                    session_headers,
+                    base_url,
+                    path,
+                    call_params,
+                    page_size,
+                    container_key,
+                    outdir=outdir,
+                    name=child_name,
+                    resume=resume,
+                    delay_ms=delay_ms,
+                    max_pages=max_pages,
+                    raw_json=raw_json,
+                    parent_dir_suffix=parent_suffix,
+                    current_group=group,
                 )
-            write_ndjson_line(nd_path, payload,
-                              container_key=container_key, allow_envelope=True)
-            continue
-
-        # Collection child (paginated), possibly with hydration
-        hydrate = child_def.get("hydrate")
-        if not hydrate:
-            parent_suffix = f"{listing_name}_{parent_id}"
-            pages = paginate_collect(
-                session_headers,
-                base_url,
-                path,
-                call_params,
-                page_size,
-                container_key,
-                outdir=outdir,
-                name=child_name,
-                resume=resume,
-                delay_ms=delay_ms,
-                max_pages=max_pages,
-                raw_json=raw_json,
-                parent_dir_suffix=parent_suffix,
-                current_group=group,
-            )
-            if pages == 0:
-                empty_idx = outdir / f"{child_name}.empty.ndjson"
-                with empty_idx.open("a", encoding="utf-8") as ef:
-                    ef.write(json.dumps(
-                        {"parent": listing_name, "parent_id": parent_id}) + "\n")
-            continue
-
-        # Hydration mode — need to inspect items to decide if a detail fetch is required
-        nd_rows_path = outdir / f"{child_name}.ndjson"
-        require_keys = hydrate.get("require_keys") or []
-        detail_path_tmpl = hydrate["path"]
-        detail_id_field = hydrate.get("id_field", "id")
-
-        page = 1
-        while True:
-            params = dict(call_params)
-            params["page"] = page
-            params["page_size"] = page_size
-            payload, _ = robust_get(
-                url, encode_params(params), session_headers)
-            items, _ck = extract_items(payload, container_key)
-
-            if not items:
-                if page == 1:
+                if pages == 0:
                     empty_idx = outdir / f"{child_name}.empty.ndjson"
                     with empty_idx.open("a", encoding="utf-8") as ef:
                         ef.write(json.dumps(
                             {"parent": listing_name, "parent_id": parent_id}) + "\n")
-                break
+                continue
 
-            with nd_rows_path.open("a", encoding="utf-8") as out_f:
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
+            # Hydration mode — need to inspect items to decide if a detail fetch is required
+            nd_rows_path = outdir / f"{child_name}.ndjson"
+            require_keys = hydrate.get("require_keys") or []
+            detail_path_tmpl = hydrate["path"]
+            detail_id_field = hydrate.get("id_field", "id")
 
-                    # Optional checklist filter: keep only those with at least one item in any section
-                    if checklists_non_empty_only and "checklists" in child_name:
-                        obj_to_write = item
+            page = 1
+            while True:
+                params = dict(call_params)
+                params["page"] = page
+                params["page_size"] = page_size
+                payload, _ = robust_get(
+                    url, encode_params(params), session_headers)
+                items, _ck = extract_items(payload, container_key)
+
+                if not items:
+                    if page == 1:
+                        empty_idx = outdir / f"{child_name}.empty.ndjson"
+                        with empty_idx.open("a", encoding="utf-8") as ef:
+                            ef.write(json.dumps(
+                                {"parent": listing_name, "parent_id": parent_id}) + "\n")
+                    break
+
+                with nd_rows_path.open("a", encoding="utf-8") as out_f:
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+
+                        # Optional checklist filter: keep only those with at least one item in any section
+                        if checklists_non_empty_only and "checklists" in child_name:
+                            obj_to_write = item
+                            if needs_hydration(item, require_keys):
+                                cid = item.get(detail_id_field)
+                                if cid:
+                                    d_path = detail_path_tmpl.replace(
+                                        "{id}", str(cid))
+                                    try:
+                                        detail, _ = robust_get(
+                                            f"{base_url}{d_path}", {}, session_headers)
+                                        if isinstance(detail, dict):
+                                            obj_to_write = detail
+                                    except requests.exceptions.HTTPError:
+                                        pass
+                            if checklist_has_content(obj_to_write):
+                                out_f.write(json.dumps(
+                                    obj_to_write, ensure_ascii=False) + "\n")
+                            else:
+                                ei = outdir / f"{child_name}.empty.ndjson"
+                                with ei.open("a", encoding="utf-8") as ef:
+                                    ef.write(json.dumps({
+                                        "parent": listing_name,
+                                        "parent_id": parent_id,
+                                        "checklist_id": obj_to_write.get("id"),
+                                        "title": obj_to_write.get("title")
+                                    }) + "\n")
+                            continue
+
+                        # Default: hydrate only when required keys are missing (missing, not empty)
                         if needs_hydration(item, require_keys):
                             cid = item.get(detail_id_field)
                             if cid:
-                                d_path = detail_path_tmpl.replace(
-                                    "{id}", str(cid))
+                                d_path = detail_path_tmpl.replace("{id}", str(cid))
                                 try:
                                     detail, _ = robust_get(
                                         f"{base_url}{d_path}", {}, session_headers)
                                     if isinstance(detail, dict):
-                                        obj_to_write = detail
+                                        out_f.write(json.dumps(
+                                            detail, ensure_ascii=False) + "\n")
+                                        continue
                                 except requests.exceptions.HTTPError:
                                     pass
-                        if checklist_has_content(obj_to_write):
-                            out_f.write(json.dumps(
-                                obj_to_write, ensure_ascii=False) + "\n")
-                        else:
-                            ei = outdir / f"{child_name}.empty.ndjson"
-                            with ei.open("a", encoding="utf-8") as ef:
-                                ef.write(json.dumps({
-                                    "parent": listing_name,
-                                    "parent_id": parent_id,
-                                    "checklist_id": obj_to_write.get("id"),
-                                    "title": obj_to_write.get("title")
-                                }) + "\n")
-                        continue
+                        out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-                    # Default: hydrate only when required keys are missing (missing, not empty)
-                    if needs_hydration(item, require_keys):
-                        cid = item.get(detail_id_field)
-                        if cid:
-                            d_path = detail_path_tmpl.replace("{id}", str(cid))
-                            try:
-                                detail, _ = robust_get(
-                                    f"{base_url}{d_path}", {}, session_headers)
-                                if isinstance(detail, dict):
-                                    out_f.write(json.dumps(
-                                        detail, ensure_ascii=False) + "\n")
-                                    continue
-                            except requests.exceptions.HTTPError:
-                                pass
-                    out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-            if len(items) < page_size:
-                break
-            page += 1
+                if len(items) < page_size:
+                    break
+                page += 1
+    finally:
+        if single_obj_file:
+            single_obj_file.close()
 
 
 def validate_endpoints(spec: Any) -> List[Dict[str, Any]]:

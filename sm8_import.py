@@ -47,6 +47,7 @@ import random
 import re
 import sys
 import time
+import uuid
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from collections import deque
 
@@ -467,19 +468,12 @@ def sm8_request(
 # ---------------- Lookups & Creation ----------------
 
 
-def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Prefer a 'service' address; fall back to 'billing'. Returns keys: street, city, state, zip, country.
-    """
-    addrs = hcp_customer.get("addresses") or []
-    service = next((a for a in addrs if (a.get("type") or "").lower() == "service"), None)
-    billing = next((a for a in addrs if (a.get("type") or "").lower() == "billing"), None)
-    a = service or billing or {}
-    
+def normalize_hcp_address(a: Dict[str, Any]) -> Dict[str, str]:
+    if not a:
+        return {}
     s1 = a.get("street") or a.get("street_line_1") or ""
     s2 = a.get("street_line_2") or ""
     street = f"{s1}\n{s2}".strip() if s2 else s1
-
     return {
         "street": street,
         "city": a.get("city") or "",
@@ -489,10 +483,40 @@ def pick_best_address(hcp_customer: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def extract_addresses(hcp_customer: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    addrs = hcp_customer.get("addresses") or []
+    service = next((a for a in addrs if (a.get("type") or "").lower() == "service"), None)
+    billing = next((a for a in addrs if (a.get("type") or "").lower() == "billing"), None)
+    
+    norm_service = normalize_hcp_address(service)
+    norm_billing = normalize_hcp_address(billing)
+    
+    # Fallback for main address (ServiceM8 address fields)
+    main_addr = norm_service if any(norm_service.values()) else norm_billing
+    
+    return main_addr, norm_billing
+
+
+def format_address_string(addr: Dict[str, str]) -> str:
+    parts = []
+    if addr.get("street"): parts.append(addr["street"])
+    
+    line2 = []
+    if addr.get("city"): line2.append(addr["city"])
+    if addr.get("state"): line2.append(addr["state"])
+    if addr.get("zip"): line2.append(addr["zip"])
+    
+    if line2: parts.append(" ".join(line2))
+    if addr.get("country"): parts.append(addr["country"])
+    
+    return "\n".join(parts)
+
+
 def map_company_payload(
     *,
     name: str,
     address: Optional[Dict[str, str]] = None,
+    billing_address: Optional[str] = None,
     is_individual: bool,
     parent_company_uuid: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -505,7 +529,8 @@ def map_company_payload(
         "address_state": address.get("state") or None,
         "address_postcode": address.get("zip") or None,
         "address_country": address.get("country") or None,
-        "is_individual": 1 if is_individual else 0,
+        "billing_address": billing_address or None,
+        "is_individual": "1" if is_individual else "0",
     }
     if parent_company_uuid:
         obj["parent_company_uuid"] = parent_company_uuid
@@ -540,7 +565,7 @@ def map_contact_payload(
     if type_value:
         obj["type"] = type_value            # e.g. "BILLING"
     if primary:
-        obj["is_primary_contact"] = 1       # mark as primary
+        obj["is_primary_contact"] = "1"       # mark as primary
     return {k: v for k, v in obj.items() if v not in (None, "", [])}
 
 
@@ -951,6 +976,197 @@ def reactivate_from_hcp(
 # ---------------- Importers ----------------
 
 
+def map_job_status(hcp_status: str) -> str:
+    s = (hcp_status or "").lower()
+    if s in ("finished", "completed", "paid"):
+        return "Completed"
+    if s in ("canceled", "cancelled"):
+        return "Unsuccessful"
+    return "Work Order"
+
+
+def deterministic_uuid(source_str: str) -> str:
+    """
+    Generate a deterministic UUID from a source string using UUID5.
+    """
+    # Arbitrary namespace UUID
+    namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
+    return str(uuid.uuid5(namespace, source_str))
+
+
+def create_job_contact(
+    headers: Dict[str, str],
+    *,
+    payload: Dict[str, Any],
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> str:
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "job_contacts", "action": "dry_post", "key": payload.get("job_uuid"),
+            "method": "POST", "resource": "/jobcontact.json", "status": 0,
+            "request": {"json": payload},
+        }, detail=audit_detail)
+        return "dry-run-job-contact-uuid"
+
+    data, resp = sm8_request("POST", "/jobcontact.json", headers,
+                             json_body=payload, audit=audit, audit_detail=audit_detail,
+                             entity="job_contacts", action="create", key=payload.get("job_uuid"))
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    return uuid
+
+
+def create_job(
+    headers: Dict[str, str],
+    *,
+    payload: Dict[str, Any],
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> str:
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "jobs", "action": "dry_post", "key": payload.get("job_description"),
+            "method": "POST", "resource": "/job.json", "status": 0,
+            "request": {"json": payload},
+        }, detail=audit_detail)
+        return "dry-run-job-uuid"
+
+    data, resp = sm8_request("POST", "/job.json", headers,
+                             json_body=payload, audit=audit, audit_detail=audit_detail,
+                             entity="jobs", action="create", key=payload.get("job_description"))
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    if not uuid:
+        raise RuntimeError("Job created but no uuid returned")
+    return uuid
+
+
+def create_job_payment(
+    headers: Dict[str, str],
+    *,
+    payload: Dict[str, Any],
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> str:
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "job_payments", "action": "dry_post", "key": payload.get("job_uuid"),
+            "method": "POST", "resource": "/jobpayment.json", "status": 0,
+            "request": {"json": payload},
+        }, detail=audit_detail)
+        return "dry-run-payment-uuid"
+
+    data, resp = sm8_request("POST", "/jobpayment.json", headers,
+                             json_body=payload, audit=audit, audit_detail=audit_detail,
+                             entity="job_payments", action="create", key=payload.get("job_uuid"))
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    return uuid
+
+
+def create_note(
+    headers: Dict[str, str],
+    *,
+    payload: Dict[str, Any],
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> str:
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "notes", "action": "dry_post", "key": payload.get("related_object_uuid"),
+            "method": "POST", "resource": "/note.json", "status": 0,
+            "request": {"json": payload},
+        }, detail=audit_detail)
+        return "dry-run-note-uuid"
+
+    data, resp = sm8_request("POST", "/note.json", headers,
+                             json_body=payload, audit=audit, audit_detail=audit_detail,
+                             entity="notes", action="create", key=payload.get("related_object_uuid"))
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    return uuid
+
+
+def create_attachment(
+    headers: Dict[str, str],
+    *,
+    payload: Dict[str, Any],
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> str:
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "attachments", "action": "dry_post", "key": payload.get("attachment_name"),
+            "method": "POST", "resource": "/attachment.json", "status": 0,
+            "request": {"json": payload},
+        }, detail=audit_detail)
+        return "dry-run-attachment-uuid"
+
+    data, resp = sm8_request("POST", "/attachment.json", headers,
+                             json_body=payload, audit=audit, audit_detail=audit_detail,
+                             entity="attachments", action="create", key=payload.get("attachment_name"))
+    uuid = resp.headers.get("x-record-uuid") or (data or {}).get("uuid")
+    return uuid
+
+
+def upload_attachment_content(
+    headers: Dict[str, str],
+    *,
+    attachment_uuid: str,
+    file_content: bytes,
+    dry_run: bool,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> None:
+    resource = f"/attachment/{attachment_uuid}.file"
+    if dry_run:
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "attachments", "action": "dry_upload", "key": attachment_uuid,
+            "method": "POST", "resource": resource, "status": 0,
+            "request": {"size": len(file_content)},
+        }, detail=audit_detail)
+        return
+
+    # Upload binary content
+    # Note: ServiceM8 expects the file content as the body
+    # We use a custom call here because sm8_request assumes JSON usually
+    url = f"{SM8_BASE_URL}{resource}"
+    session = get_session()
+    
+    # We need to respect rate limits even for uploads
+    _enforce_rpm()
+    
+    try:
+        r = session.post(
+            url,
+            data=file_content,
+            headers=headers, # headers already have Auth
+            timeout=(DEFAULT_CONNECT_TIMEOUT, 300.0) # longer read timeout for uploads
+        )
+        
+        if r.status_code >= 400:
+            log.error("Upload failed %s -> HTTP %s", resource, r.status_code)
+            _append_audit(audit, {
+                "ts": time.time(), "entity": "attachments", "action": "upload_error", "key": attachment_uuid,
+                "method": "POST", "resource": resource, "status": r.status_code,
+                "response": {"text": r.text[:200]},
+            }, detail=audit_detail)
+        else:
+            _append_audit(audit, {
+                "ts": time.time(), "entity": "attachments", "action": "upload", "key": attachment_uuid,
+                "method": "POST", "resource": resource, "status": r.status_code,
+            }, detail=audit_detail)
+
+    except Exception as e:
+        log.error("Upload exception %s: %s", resource, e)
+        _append_audit(audit, {
+            "ts": time.time(), "entity": "attachments", "action": "upload_exception", "key": attachment_uuid,
+            "error": str(e),
+        }, detail=audit_detail)
+
+
 def get_full_name(hcp: Dict[str, Any]) -> str:
     first = (hcp.get("first_name") or "").strip()
     last = (hcp.get("last_name") or "").strip()
@@ -960,6 +1176,23 @@ def get_full_name(hcp: Dict[str, Any]) -> str:
     if email:
         return email.split("@")[0]
     return ""
+
+
+def hcp_id_to_uuid(hcp_id: Optional[str]) -> Optional[str]:
+    """
+    Convert HCP ID (e.g. 'job_20c73b1fb00b4262bab76848102352ef') 
+    to UUID (e.g. '20c73b1f-b00b-4262-bab7-6848102352ef').
+    Returns None if format doesn't match 32-char hex suffix.
+    """
+    if not hcp_id:
+        return None
+    parts = hcp_id.split("_")
+    hex_part = parts[-1] if len(parts) > 1 else hcp_id
+    
+    if len(hex_part) != 32:
+        return None
+        
+    return f"{hex_part[:8]}-{hex_part[8:12]}-{hex_part[12:16]}-{hex_part[16:20]}-{hex_part[20:]}"
 
 
 def import_employees(
@@ -1112,7 +1345,8 @@ def import_customers(
         phone = norm_phone(hcp.get("home_number") or hcp.get("work_number"))
         mobile = norm_phone(hcp.get("mobile_number"))
         
-        address = pick_best_address(hcp)
+        main_addr, billing_addr_dict = extract_addresses(hcp)
+        billing_addr_str = format_address_string(billing_addr_dict)
 
         # No company: single Client (individual) + create a BILLING primary contact
         if not comp:
@@ -1130,7 +1364,8 @@ def import_customers(
             if not client_uuid:
                 client_payload = map_company_payload(
                     name=client_name,
-                    address=address,
+                    address=main_addr,
+                    billing_address=billing_addr_str,
                     is_individual=True
                 )
                 client_uuid = create_company(
@@ -1143,11 +1378,11 @@ def import_customers(
                     company_cache[client_name] = client_uuid
 
             # address merge (only for existing individual clients and when we have an address)
-            if not created_now and any(address.values()):
+            if not created_now and any(main_addr.values()):
                 merged = maybe_merge_address_into_individual(
                     headers,
                     company_uuid=client_uuid,
-                    hcp_address=address,
+                    hcp_address=main_addr,
                     mode=merge_address_mode,
                     audit=audit,
                     audit_detail=audit_detail,
@@ -1196,15 +1431,15 @@ def import_customers(
 
         # Site (by address) — dedupe on parent + address fields
         site_uuid: Optional[str] = None
-        if any(address.values()):
+        if any(main_addr.values()):
             site_uuid = find_site_by_address(headers, parent_uuid=parent_uuid,
-                                             street=address.get("street", ""), city=address.get("city", ""),
-                                             state=address.get("state", ""), postcode=address.get("zip", ""),
+                                             street=main_addr.get("street", ""), city=main_addr.get("city", ""),
+                                             state=main_addr.get("state", ""), postcode=main_addr.get("zip", ""),
                                              audit=audit, audit_detail=audit_detail)
             if not site_uuid:
                 site_payload = map_company_payload(
                     name=comp,
-                    address=address,
+                    address=main_addr,
                     is_individual=False,
                     parent_company_uuid=parent_uuid
                 )
@@ -1226,6 +1461,392 @@ def import_customers(
     log.info("[SUMMARY] customers processed=%d created_clients=%d created_sites=%d "
              "created_contacts=%d merged_addresses=%d",
              processed, created_clients, created_sites, created_contacts, merged_addresses)
+
+
+def preload_payments(run_dir: pathlib.Path) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Load all payments from invoices.ndjson into a dict keyed by HCP Job ID.
+    """
+    src = run_dir / "invoices.ndjson"
+    if not src.exists():
+        return {}
+    
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for row in iter_ndjson(src):
+        job_id = row.get("job_id")
+        payments = row.get("payments")
+        if job_id and payments:
+            if job_id not in out:
+                out[job_id] = []
+            # Attach the invoice ID to the payment for uniqueness generation later
+            for p in payments:
+                p["_invoice_id"] = row.get("id")
+            out[job_id].extend(payments)
+    return out
+
+
+def import_jobs(
+    run_dir: pathlib.Path,
+    headers: Dict[str, str],
+    *,
+    dry_run: bool,
+    limit: Optional[int],
+    skip: int,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+    target_job_id: Optional[str] = None,
+) -> None:
+    src = run_dir / "jobs.ndjson"
+    if not src.exists():
+        log.warning("jobs.ndjson not found in %s; nothing to import.", run_dir)
+        return
+
+    # Preload payments
+    job_payments_map = preload_payments(run_dir)
+    log.info("Preloaded payments for %d jobs", len(job_payments_map))
+
+    log.info("Importing jobs from %s", src)
+    processed = 0
+    created_jobs = 0
+    created_notes = 0
+    created_contacts = 0
+    created_payments = 0
+    created_attachments = 0
+    skipped_no_company = 0
+
+    company_cache: Dict[str, str] = {}
+
+    for hcp in iter_ndjson(src):
+        if target_job_id and hcp.get("id") != target_job_id:
+            continue
+
+        processed += 1
+        if processed <= max(skip, 0):
+            continue
+        if limit is not None and (processed - max(skip, 0)) > max(limit, 0):
+            break
+
+        # 1. Find Company
+        cust = hcp.get("customer") or {}
+        comp_name = (cust.get("company") or "").strip()
+        if not comp_name:
+            # Fallback to individual name
+            first = (cust.get("first_name") or "").strip()
+            last = (cust.get("last_name") or "").strip()
+            if first or last:
+                comp_name = f"{first} {last}".strip()
+            else:
+                # Try email?
+                email = (cust.get("email") or "").strip()
+                if email:
+                    comp_name = email.split("@")[0]
+        
+        if not comp_name:
+            log.warning("Job %s has no customer name/company. Skipping.", hcp.get("id"))
+            skipped_no_company += 1
+            continue
+
+        if comp_name in company_cache:
+            company_uuid = company_cache[comp_name]
+        else:
+            company_uuid = find_company_by_name(headers, name=comp_name, audit=audit, audit_detail=audit_detail)
+            if company_uuid:
+                company_cache[comp_name] = company_uuid
+        
+        if not company_uuid:
+            # If we are targeting a specific job, try to create the customer on the fly
+            if target_job_id:
+                log.info("Targeted Job: Customer '%s' not found. Creating on-the-fly...", comp_name)
+                
+                # Prepare address
+                job_addr_raw = hcp.get("address") or {}
+                norm_addr = normalize_hcp_address(job_addr_raw)
+                billing_addr_str = format_address_string(norm_addr)
+
+                # Prepare customer data
+                cust_data = hcp.get("customer") or {}
+                is_individual = not bool(cust_data.get("company"))
+                
+                # Create Client
+                client_payload = map_company_payload(
+                    name=comp_name,
+                    address=norm_addr,
+                    billing_address=billing_addr_str,
+                    is_individual=is_individual
+                )
+                company_uuid = create_company(
+                    headers, payload=client_payload, dry_run=dry_run,
+                    audit=audit, audit_detail=audit_detail
+                )
+                
+                # Create Contact
+                # cust_data has first_name, last_name, etc.
+                contact_payload = map_contact_payload(
+                    company_uuid, cust_data, type_value="BILLING", primary=True
+                )
+                create_contact(
+                    headers, payload=contact_payload, dry_run=dry_run,
+                    audit=audit, audit_detail=audit_detail
+                )
+                
+                # Cache it
+                if company_uuid:
+                    company_cache[comp_name] = company_uuid
+
+            else:
+                log.warning("Company '%s' not found for Job %s. Skipping.", comp_name, hcp.get("id"))
+                skipped_no_company += 1
+                continue
+
+        # 2. Prepare Job Payload
+        addr = normalize_hcp_address(hcp.get("address") or {})
+        status = map_job_status(hcp.get("work_status"))
+        desc = hcp.get("description") or "Imported Job"
+        
+        # Date handling
+        job_created_at = hcp.get("created_at")
+        formatted_date = None
+        if job_created_at:
+            # 2025-10-21T17:03:54Z -> 2025-10-21
+            formatted_date = job_created_at.split("T")[0]
+
+        # Deterministic UUID from HCP ID
+        hcp_job_id = hcp.get("id")
+        deterministic_job_uuid = hcp_id_to_uuid(hcp_job_id)
+
+        job_payload = {
+            "uuid": deterministic_job_uuid,
+            "company_uuid": company_uuid,
+            "job_description": desc,
+            "status": status,
+            "address_street": addr.get("street"),
+            "address_city": addr.get("city"),
+            "address_state": addr.get("state"),
+            "address_postcode": addr.get("zip"),
+            "address_country": addr.get("country"),
+            "job_address": format_address_string(addr),
+            "date": formatted_date,
+        }
+        # Clean None values
+        job_payload = {k: v for k, v in job_payload.items() if v}
+
+        # 3. Create Job
+        job_uuid = create_job(headers, payload=job_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+        created_jobs += 1
+
+        # 4. Create Job Contact
+        # Use customer info from the job record
+        c_first = (cust.get("first_name") or "").strip()
+        c_last = (cust.get("last_name") or "").strip()
+        c_email = (cust.get("email") or "").strip()
+        c_mobile = norm_phone(cust.get("mobile_number"))
+        c_phone = norm_phone(cust.get("home_number") or cust.get("work_number"))
+
+        if c_first or c_last:
+            # Generate a deterministic UUID for the contact to avoid duplicates
+            # Key: job_uuid + "contact" + email/phone
+            contact_key = f"{job_uuid}_contact_{c_email}_{c_mobile}"
+            contact_uuid = deterministic_uuid(contact_key)
+
+            contact_payload = {
+                "uuid": contact_uuid,
+                "job_uuid": job_uuid,
+                "first": c_first,
+                "last": c_last,
+                "email": c_email,
+                "mobile": c_mobile,
+                "phone": c_phone,
+                "type": "JOB"
+            }
+            contact_payload = {k: v for k, v in contact_payload.items() if v}
+            create_job_contact(headers, payload=contact_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+            created_contacts += 1
+
+        # 5. Create Notes
+        formatted_ts = None
+        if job_created_at:
+             formatted_ts = job_created_at.replace("T", " ").replace("Z", "")
+
+        notes = hcp.get("notes") or []
+        for i, n in enumerate(notes):
+            content = (n.get("content") or "").strip()
+            if not content:
+                continue
+            
+            # Deterministic UUID for note
+            note_key = f"{job_uuid}_note_{i}_{content[:20]}"
+            note_uuid = deterministic_uuid(note_key)
+
+            note_payload = {
+                "uuid": note_uuid,
+                "related_object": "job",
+                "related_object_uuid": job_uuid,
+                "note": content,
+                "action_required": "0",
+                "create_date": formatted_ts,
+            }
+            # Clean None values
+            note_payload = {k: v for k, v in note_payload.items() if v}
+
+            create_note(headers, payload=note_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+            created_notes += 1
+
+        # 6. Create Payments
+        if hcp_job_id in job_payments_map:
+            payments = job_payments_map[hcp_job_id]
+            for i, p in enumerate(payments):
+                amount_cents = p.get("amount") or 0
+                amount_str = f"{amount_cents / 100:.2f}"
+                
+                paid_at = p.get("paid_at")
+                p_formatted_ts = None
+                if paid_at:
+                    p_formatted_ts = paid_at.replace("T", " ").replace("Z", "")
+                
+                # Deterministic UUID for payment
+                # Use invoice ID + index to ensure uniqueness
+                inv_id = p.get("_invoice_id") or "unknown_invoice"
+                payment_key = f"{job_uuid}_payment_{inv_id}_{i}"
+                payment_uuid = deterministic_uuid(payment_key)
+
+                payment_payload = {
+                    "uuid": payment_uuid,
+                    "job_uuid": job_uuid,
+                    "amount": amount_str,
+                    "method": p.get("payment_method") or "Other",
+                    "timestamp": p_formatted_ts,
+                    "note": p.get("note"),
+                }
+                # Clean None values
+                payment_payload = {k: v for k, v in payment_payload.items() if v}
+
+                create_job_payment(headers, payload=payment_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+                created_payments += 1
+
+        # 7. Create Attachments
+        attachments = hcp.get("attachments") or []
+        for i, att in enumerate(attachments):
+            url = att.get("url")
+            if not url:
+                continue
+            
+            file_name = att.get("file_name") or f"attachment_{i}"
+            file_type = att.get("file_type") or "application/octet-stream"
+            
+            # Deterministic UUID for attachment
+            # Key: job_uuid + "attachment" + file_name + index
+            att_key = f"{job_uuid}_attachment_{file_name}_{i}"
+            att_uuid = deterministic_uuid(att_key)
+            
+            att_payload = {
+                "uuid": att_uuid,
+                "related_object": "job",
+                "related_object_uuid": job_uuid,
+                "attachment_name": file_name,
+                "file_type": file_type,
+                "attachment_source": "JOB",
+                "tags": "HCP Import",
+            }
+            
+            # Create metadata
+            create_attachment(headers, payload=att_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+            
+            # Download and Upload content
+            if not dry_run:
+                try:
+                    # Download from S3
+                    dl_resp = requests.get(url, timeout=60)
+                    if dl_resp.status_code == 200:
+                        content = dl_resp.content
+                        upload_attachment_content(headers, attachment_uuid=att_uuid, file_content=content, 
+                                                  dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+                        created_attachments += 1
+                    else:
+                        msg = f"HTTP {dl_resp.status_code}"
+                        if dl_resp.status_code == 403:
+                            msg += " (Link likely expired - get a fresh export)"
+                        log.warning("Failed to download attachment %s: %s", file_name, msg)
+                except Exception as e:
+                    log.warning("Exception downloading attachment %s: %s", file_name, e)
+            else:
+                # Dry run: pretend we uploaded
+                upload_attachment_content(headers, attachment_uuid=att_uuid, file_content=b"dry_run_content", 
+                                          dry_run=True, audit=audit, audit_detail=audit_detail)
+                created_attachments += 1
+
+    log.info("[SUMMARY] jobs processed=%d created_jobs=%d created_notes=%d created_contacts=%d created_payments=%d created_attachments=%d skipped_no_company=%d",
+             processed, created_jobs, created_notes, created_contacts, created_payments, created_attachments, skipped_no_company)
+
+
+
+def import_payments(
+    run_dir: pathlib.Path,
+    headers: Dict[str, str],
+    *,
+    dry_run: bool,
+    limit: Optional[int],
+    skip: int,
+    audit: Optional[pathlib.Path],
+    audit_detail: bool,
+) -> None:
+    src = run_dir / "invoices.ndjson"
+    if not src.exists():
+        log.warning("invoices.ndjson not found in %s; nothing to import.", run_dir)
+        return
+
+    log.info("Importing payments from %s", src)
+    processed = 0
+    created_payments = 0
+    skipped_no_job = 0
+
+    for inv in iter_ndjson(src):
+        payments = inv.get("payments") or []
+        if not payments:
+            continue
+        
+        hcp_job_id = inv.get("job_id")
+        if not hcp_job_id:
+            continue
+
+        processed += 1
+        if processed <= max(skip, 0):
+            continue
+        if limit is not None and (processed - max(skip, 0)) > max(limit, 0):
+            break
+
+        # Deterministic UUID from HCP Job ID
+        job_uuid = hcp_id_to_uuid(hcp_job_id)
+        
+        if not job_uuid:
+            log.warning("Could not derive UUID from HCP Job ID %s. Skipping payments.", hcp_job_id)
+            skipped_no_job += 1
+            continue
+
+        for p in payments:
+            amount_cents = p.get("amount") or 0
+            amount_str = f"{amount_cents / 100:.2f}"
+            
+            paid_at = p.get("paid_at")
+            formatted_ts = None
+            if paid_at:
+                formatted_ts = paid_at.replace("T", " ").replace("Z", "")
+            
+            payment_payload = {
+                "job_uuid": job_uuid,
+                "amount": amount_str,
+                "method": p.get("payment_method") or "Other",
+                "timestamp": formatted_ts,
+                "note": p.get("note"),
+            }
+            # Clean None values
+            payment_payload = {k: v for k, v in payment_payload.items() if v}
+
+            create_job_payment(headers, payload=payment_payload, dry_run=dry_run, audit=audit, audit_detail=audit_detail)
+            created_payments += 1
+
+    log.info("[SUMMARY] invoices_with_payments_processed=%d created_payments=%d skipped_no_job=%d",
+             processed, created_payments, skipped_no_job)
+
 
 # ---------------- CLI ----------------
 
@@ -1261,7 +1882,7 @@ def main() -> None:
                     help="Path to NDJSON run dir (or base dir when used with --latest). Default ./hcp_export")
     ap.add_argument("--latest", action="store_true",
                     help="Pick newest timestamped subfolder under --ndjson-dir (or ./hcp_export)")
-    ap.add_argument("--only", choices=["employees", "customers"], default="employees", help="Entity to import")
+    ap.add_argument("--only", choices=["employees", "customers", "jobs", "payments"], default="employees", help="Entity to import")
     ap.add_argument("--dry-run", action="store_true", help="Print actions but do not POST")
     ap.add_argument("--limit", type=int, help="Import at most N records (per entity) OR max activations for reactivate")
     ap.add_argument("--skip", type=int, default=0, help="Skip the first N source records")
@@ -1270,6 +1891,7 @@ def main() -> None:
     ap.add_argument("--audit-file", help="Write NDJSON audit lines to a new timestamped file based on this path")
     ap.add_argument("--audit-detail", action="store_true",
                     help="Include response previews and key headers in audit lines")
+    ap.add_argument("--job-id", help="Filter import to a specific Job ID (for testing)")
 
     # Address merge behavior for existing individual clients
     ap.add_argument("--merge-address", choices=["off", "missing", "always"], default="missing",
@@ -1344,6 +1966,19 @@ def main() -> None:
             run_dir, headers,
             dry_run=args.dry_run, limit=args.limit, skip=args.skip,
             merge_address_mode=args.merge_address,
+            audit=audit_path, audit_detail=args.audit_detail,
+        )
+    elif args.only == "jobs":
+        import_jobs(
+            run_dir, headers,
+            dry_run=args.dry_run, limit=args.limit, skip=args.skip,
+            audit=audit_path, audit_detail=args.audit_detail,
+            target_job_id=args.job_id,
+        )
+    elif args.only == "payments":
+        import_payments(
+            run_dir, headers,
+            dry_run=args.dry_run, limit=args.limit, skip=args.skip,
             audit=audit_path, audit_detail=args.audit_detail,
         )
     else:
